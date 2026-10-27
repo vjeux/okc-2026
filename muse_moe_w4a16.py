@@ -1,10 +1,60 @@
 # okc: problem=muse_moe_w4a16
-"""Routed experts (NVFP4 W4A16 MoE) as one persistent CUDA kernel plus two tiny ones.
+"""Routed experts (NVFP4 W4A16 MoE) as one persistent CUDA kernel.
 
-route_kernel builds the per-expert token lists on device; moe_main streams each touched expert's
-prepacked NVFP4 weights once (GEMM1 + SwiGLU, then GEMM2 + scaled output + sum of squares for the
-post-expert RMSNorm); final_kernel applies the norm and the routing weights and sums per token.
-Weights are only repacked (bit/byte permutations), never requantized.
+Algorithm
+---------
+For each token, up to ``TOP_K`` of the 256 experts are active, and this rank
+owns ``LOCAL_EXPERTS`` of them. The work is a gated MLP per expert:
+
+1.  Routing (``route`` in the CUDA source): every CTA redundantly builds the
+    same per-expert token lists from ``topk_ids`` -- counts, offsets, and a
+    sorted ``(token, slot)`` entry list -- plus a job list. An expert with
+    more than ``SKINNY_MAX_TOKENS`` tokens becomes one or more *fat* jobs
+    (chunks of ``FAT_MAX_TOKENS`` tokens); the rest become *skinny* jobs.
+    Fat jobs are listed first, largest first.
+2.  Phase A (gate + up, ``GEMM1 + SwiGLU``): each job's tokens are
+    multiplied by the expert's packed NVFP4 gate/up weights. A *skinny* unit
+    is 16 rows x full K with warps splitting K and ``mma.sync``; a *fat*
+    unit is 256 rows x full K streamed through shared memory in K-stages.
+    The SwiGLU output lands in ``inter`` (bf16).
+3.  Phase B (down, ``GEMM2``): the same jobs run again with the expert's
+    down weights, reading ``inter``. The epilogue multiplies by
+    ``1 + post_norm_w`` (the post-expert RMSNorm weight, kept bf16 as given)
+    and writes fp32 rows to ``ybuf`` plus each route's sum of squares to
+    ``ss`` (double-buffered per launch generation).
+4.  Final pass: ``out[t] = sum_s topk_w[t, s] * rsqrt(ss[pos] / HIDDEN + eps)
+    * ybuf[pos]``. A grid barrier between the phases and the final pass
+    makes every CTA's phase-B writes visible to every CTA.
+
+Scheduling: one persistent grid (one CTA per SM) runs both phases. Fat
+units go first (round-robin over CTAs); skinny units are split by cost so
+every CTA carries the same total cost, with a small run-time pool of tail
+units claimed atomically (stream-K). With no fat jobs, phase A's last ring
+refills already prefetch this CTA's first phase-B units (cross-phase
+prefill).
+
+Which kernel runs depends on the batch: ``kernel_fn`` picks one of four
+compile-time variants of the same source (``MAIN`` / ``TINY`` / ``TINY2`` /
+``MID``), selected by token count; the large-batch variant additionally
+switches to an RS-wgmma implementation (``OKC_WGS``) for the main band.
+Weights are only repacked (bit/byte permutations) in ``prepare`` -- never
+requantized -- into the four layouts the kernel reads: packed
+mma.sync order, fat order, unit-contiguous order, and natural-k / WGS
+order.
+
+Constraints the code preserves (OKC rules)
+------------------------------------------
+* One Python file; native CUDA only, via ``torch.utils.cpp_extension.
+  load_inline``.
+* CUDA-graph capturable: no host synchronisation in the timed path.
+  ``kernel_fn`` allocates a fresh ``out`` every call, reads no tensor
+  back to host, and launches only ``okc_run``. Host syncs exist only in
+  ``prepare`` (one-time setup) and in the ``DIAG`` diagnostics, both
+  outside the timed path.
+* Fresh inputs each call, no caching across calls: the only
+  module-level cache is ``_EXTS``, which maps a compile-time define
+  tuple to its compiled extension module. It caches compiled code,
+  never activations, weights, or outputs.
 """
 
 from typing import TypedDict
@@ -41,7 +91,110 @@ class Inputs(TypedDict):
     config: Config
 
 
+# ---------------------------------------------------------------- model shape
+# These are the task's model dimensions, not tunables. The CUDA source has
+# its own copies (HD / ID) because it is compiled standalone; keep them in
+# sync by hand -- there is no mechanism to share a constant across the
+# Python/CUDA boundary in a load_inline submission.
+HIDDEN = 4096            # d_hidden and d_expert (the MoE is square)
+TOP_K = 8                # routes per token
+N_EXPERTS_TOTAL = 256    # experts across all ranks
+LOCAL_START = 0          # first expert owned by this rank
+LOCAL_EXPERTS = 32       # experts owned by this rank (ep8 sharding)
+SHARDING = "ep8"
+
+# ------------------------------------------------------- per-call chunking
+# kernel_fn runs the kernel in slices of at most this many tokens: the
+# kernel's scratch (inter / ybuf / ss) is sized for this bound.
+CHUNK_TOKENS = 384
+EMAX = CHUNK_TOKENS * TOP_K          # max (token, route) entries per chunk
+JMAX = 32 + EMAX // 64 + 8           # max jobs per chunk (upper bound)
+
+# ------------------------------------------------------------- WGS scratch
+# Stream-K fixup area: mirror of the CUDA-side WGS_FIXF / WGS_XROWS.
+WGS_SLOTS = 160                      # fixup slots per phase (>= grid + 1)
+WGS_FIXW = 4096                      # floats per (slot, warpgroup) fixup
+WGS_FIXF = 2 * WGS_SLOTS * 4 * WGS_FIXW + 2 * WGS_SLOTS * 4 + 136 * 16
+WGS_XROWS = EMAX + 8 * (32 + EMAX // 32 + 8)
+
+# ------------------------------------------- compile-time variant selection
+# The four variants are the same CUDA source compiled with different
+# -D flags -- i.e. different tile / scheduling choices, not different code.
+# Flag tuples are part of the submission's tuned behaviour; do not edit
+# them without re-gating on GPU. kernel_fn picks by token count M.
+MAIN_DEFINES = ("-DOKC_NW=16", "-DOKC_FAST1=0", "-DOKC_EPI4=0", "-DOKC_WGS=1")
+# M <= TINY_MAX_M: skinny-only build; a job never has more than M tokens,
+# so there are no fat units.
+TINY_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_EPI4=0", "-DOKC_FAST1=2",
+                "-DOKC_L2H=0", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1",
+                "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2", "-DOKC_FINPF=1")
+TINY_MAX_M = 4
+# TINY_MAX_M < M <= TINY2_MAX_M: a second skinny-only build with a shorter
+# helper-warp tail.
+TINY2_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_CPF=0", "-DOKC_EPI4=0",
+                 "-DOKC_FAST1=2", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1",
+                 "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=1", "-DOKC_FINPF=1")
+TINY2_MAX_M = 8
+# TINY2_MAX_M < M <= MID_MAX_M: tiny-style build with experts of more than
+# SKINNY_MAX_TOKENS tokens split into <= SKINNY_MAX_TOKENS-token jobs.
+MID_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_SPLIT=1", "-DOKC_CPF=0",
+               "-DOKC_EPI4=0", "-DOKC_FAST1=2", "-DOKC_NACC=4", "-DOKC_UWARP=0",
+               "-DOKC_WS=1", "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2",
+               "-DOKC_FINPF=1")
+MID_MAX_M = 16
+# M 17..63 runs on the WGS MAIN build; M >= 64 is MAIN by default below.
+# The skinny ring's slot count when the caller does not pin -DOKC_NS.
+MAIN_NS = 3
+
+# The M >= 64 build used when the scale bytes rule out the PRMT decode
+# (the WGS kernel needs it): the mma.sync kernel with the same shapes.
+MAIN_FALLBACK_DEFINES = ("-DOKC_CPF=0", "-DOKC_CPFF=0", "-DOKC_DYNK=7",
+                         "-DOKC_EARLYN=2", "-DOKC_EPI4=0", "-DOKC_FCOSTB=35",
+                         "-DOKC_FCOSTBB=36", "-DOKC_FINCOL=0", "-DOKC_FPF=5")
+
+# ------------------------------------------------------------- feature flags
+# Programmatic dependent launch for embedders whose graph runs this kernel
+# right after other kernels (the kernel waits on griddepcontrol.wait before
+# touching their outputs). Off: one launch per call gains nothing.
+PDL = False
+# Scale decode with PRMT + IMAD instead of the smem LUT; exact only when
+# every block-scale byte of the local experts is a positive normal e4m3
+# value (0x08..0x7E). prepare() checks the actual weights and keeps the
+# LUT build otherwise.
+PRMT_SCALES = True
+# DQ7: the bit layout whose decode is 7 ALU ops + 2 IMAD.SHL per 8 weights
+# (the kernel gets -DOKC_DQ7=1 via _ext).
+DQ7 = True
+
+# ---------------------------------------------------------------- diagnostics
+# All off in a submission run. DIAG makes prepare() print an H200 timing
+# table (untimed); DIAG_BW additionally runs the BW_SRC microbenchmarks.
+DIAG = False
+DIAG_VARIANTS = {}         # name -> defines, timed in diag mode
+DIAG_BW = False
+DIAG_BW_MODES = (5, 8, 12, 16) + tuple(range(17, 25))
+
+# Extension-point for out-of-tree experiments: "@name" in a defines tuple
+# swaps the compiled source to ALT_SRCS[name]. Empty in a submission.
+ALT_SRCS = {}
+
+# Bit layout of a 32-bit word holding 8 E2M1 codes for one MMA k-step of
+# one lane: register R (0..3) is (h, j0) = (0,0) (1,0) (0,2) (1,2): rows
+# g+8h, k = base + 4s + j0 (+1 for the upper bf16). Code bits (m, e0, e1, s)
+# land at output bits (6, 7, 8, 15) (+16 for the upper half) after the
+# per-register rotation used by dq4().
+_REG_HJ = [(0, 0), (1, 0), (0, 2), (1, 2)]
+
+
 CUDA_SRC = r'''
+// ---------------------------------------------------------------- roadmap
+// Compile-time knobs (OKC_* defaults, grouped below) -> Params / Smem ->
+// small helpers (dequant, mma, mbarrier, L2 hints) -> route() ->
+// skinny ring (two variants: dynamic-pool SKDYN / static, see below) ->
+// fat stream (cp.async + mma.sync, wgmma variant) -> WS helper warp ->
+// WGS (RS-wgmma, producer/consumer) -> run_phase -> moe_fused ->
+// C++ launcher okc_run. Kernel bodies below are unchanged from v216x
+// except for the dead-code removals listed in REFACTOR_NOTES.md.
 // muse_moe_w4a16 v2: one persistent kernel: routing prologue, GEMM1+SwiGLU, GEMM2+norm stats, final norm/sum.
 #include <cuda_bf16.h>
 #include <type_traits>
@@ -52,9 +205,6 @@ CUDA_SRC = r'''
 #endif
 #ifndef OKC_NS
 #define OKC_NS 4
-#endif
-#ifndef OKC_FNST
-#define OKC_FNST 4
 #endif
 #ifndef OKC_USE_TMA
 #define OKC_USE_TMA 1
@@ -67,9 +217,6 @@ CUDA_SRC = r'''
 #endif
 #ifndef OKC_BEPI
 #define OKC_BEPI 0
-#endif
-#ifndef OKC_FPF
-#define OKC_FPF 4
 #endif
 #ifndef OKC_RLOAD
 #define OKC_RLOAD 1  // routing: all topk_ids loads issued before the smem stores
@@ -172,14 +319,8 @@ CUDA_SRC = r'''
 #ifndef OKC_FCOST
 #define OKC_FCOST 40
 #endif
-#ifndef OKC_FCOST2
-#define OKC_FCOST2 OKC_FCOST
-#endif
 #ifndef OKC_FCOSTB
 #define OKC_FCOSTB 40
-#endif
-#ifndef OKC_FCOSTB2
-#define OKC_FCOSTB2 OKC_FCOSTB
 #endif
 #ifndef OKC_WS
 #define OKC_WS 0  // tiny build: one extra helper warp issues the ring's TMA copies and runs every skinny epilogue
@@ -189,9 +330,6 @@ CUDA_SRC = r'''
 #endif
 #ifndef OKC_WGSX
 #define OKC_WGSX 0  // dev: 1 = WGS without the wgmma, 2 = WGS phases skipped
-#endif
-#ifndef OKC_WGSREL32
-#define OKC_WGSREL32 0  // WGS: every consumer lane arrives on the empty slot (else lane 0 of each warp)
 #endif
 #ifndef OKC_WGS
 #define OKC_WGS 0  // tiny build on RS-wgmma: 4 consumer warpgroups split K of 64-row units, plus a TMA producer warp
@@ -400,7 +538,6 @@ __device__ __forceinline__ uint32_t bmul2h(uint32_t a, uint32_t b) {
   __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), __high2bfloat162(*reinterpret_cast<__nv_bfloat162*>(&b)));
   return *reinterpret_cast<uint32_t*>(&r);
 }
-__device__ __forceinline__ uint32_t dq_hi(uint32_t q) { return (q & 0x80008000u) | ((q & 0x70007000u) >> 6); }
 
 __device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
@@ -462,16 +599,6 @@ __device__ __forceinline__ void dq4(uint32_t q, uint32_t& r0, uint32_t& r1, uint
 #endif
 }
 
-// dequantize one 16-row x 64-K chunk word set and multiply-accumulate against b regs
-__device__ __forceinline__ void chunk_mma(uint4 w, uint32_t sg, uint32_t sg8, const uint32_t* b, float* acc) {
-  const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
-#pragma unroll
-  for (int st = 0; st < 4; ++st) {
-    uint32_t r0, r1, r2, r3;
-    dq4(ww[st], r0, r1, r2, r3);
-    mma_bf16(acc, bmul2(r0, sg), bmul2(r1, sg8), bmul2(r2, sg), bmul2(r3, sg8), b[2 * st], b[2 * st + 1]);
-  }
-}
 
 // ---------------------------------------------------------------- routing prologue (every CTA, identical result)
 __device__ void early_issue(const Params& p, Smem& S);
@@ -593,35 +720,6 @@ __device__ void route(const Params& p, Smem& S) {
     __syncwarp();
   }
   CTA_SYNC();
-}
-
-// ---------------------------------------------------------------- skinny unit: CTA = 16 rows x full K, warps split K
-template <bool PB>
-__device__ __forceinline__ void sk_load_w(const Params& p, int e, int rb, int lane, int warp, uint4 (&w)[NCH], uint4& s) {
-  const int rbs = PB ? RB_B : RB_A;
-  const uint4* wb = (PB ? p.wB : p.wA) + ((size_t)(e * rbs + rb) * NW + warp) * (NCH * 32) + lane;
-  const uint4* sb = (PB ? p.sB : p.sA) + ((size_t)(e * rbs + rb) * NW + warp) * 32 + lane;
-#pragma unroll
-  for (int c = 0; c < NCH; ++c) w[c] = ldg_stream(wb + c * 32);
-  s = ldg_stream(sb);
-}
-
-// stage x rows of a skinny job into xs [nrows][XP_SK] (rows >= cnt zero-filled)
-template <bool PB>
-__device__ __forceinline__ void sk_stage_x(const Params& p, const Smem& S, int j, __nv_bfloat16* xs, int nrows) {
-  const int tid = threadIdx.x;
-  const int cnt = S.jC[j], st = S.jS[j];
-  const int tot = nrows * (HD / 8);
-#pragma unroll 4
-  for (int i = tid; i < tot; i += NT) {
-    int r = i >> 9, c = i & 511;
-    bool v = r < cnt;
-    const __nv_bfloat16* src;
-    if (PB) src = p.inter + (size_t)(st + (v ? r : 0)) * ID + c * 8;
-    else src = p.x + (size_t)(v ? (S.ent[st + r] >> 3) : 0) * HD + c * 8;
-    cp_async16(xs + r * XP_SK + c * 8, src, v);
-  }
-  cp_commit();
 }
 
 // ---------------------------------------------------------------- epilogues (one 16-row block, tokens 2t,2t+1 of n-tile)
@@ -817,6 +915,11 @@ __device__ __forceinline__ void load_x1_smem(const Params& p, const Smem& S, int
   __syncwarp();
 }
 
+// skinny_ring exists twice, deliberately: the SKDYN variant claims tail units
+// from a run-time atomic pool, the #else variant issues a fixed static
+// range. The bodies share most of their epilogue code, but the pool-claim
+// logic interleaves with the ring refill in ways a merge would risk
+// changing; keep them in sync by hand (see REFACTOR_NOTES.md).
 #if SKDYN
 template <bool PB>
 __device__ void skinny_ring(const Params& p, Smem& S, int v0, int v1, unsigned char* ring, uint64_t* bars, int& seq,
@@ -1163,7 +1266,7 @@ __device__ void skinny_ring(const Params& p, Smem& S, int v0, int v1, unsigned c
   if (PB && tid == 0) S.preissuedB = 0;
   CTA_SYNC();
 }
-#else
+#else  // static skinny_ring: fixed range, no run-time pool
 template <bool PB>
 __device__ void skinny_ring(const Params& p, Smem& S, int v0, int v1, unsigned char* ring, uint64_t* bars, int& seq,
                             __nv_bfloat16* x1base, bool cpf_ok, int cB0, int cBn, int nSall, int poolBase) {
@@ -1498,9 +1601,6 @@ __device__ __forceinline__ void fat_issue(const Params& p, int e, int ub, int ks
 // ---------------------------------------------------------------- wgmma (sm90a): A from registers, B (x) from smem
 __device__ __forceinline__ uint64_t wg_desc_sw128(uint32_t saddr) {  // K-major, 128 B swizzle, 8-row groups 1 KB apart
   return (uint64_t)((saddr >> 4) & 0x3FFF) | ((uint64_t)1 << 16) | ((uint64_t)(1024 >> 4) << 32) | (1ull << 62);
-}
-__device__ __forceinline__ void wg_pin(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
-  asm volatile("" : "+r"(a), "+r"(b), "+r"(c), "+r"(d));
 }
 __device__ __forceinline__ uint64_t wg_desc(uint32_t saddr, uint32_t lbo, uint32_t sbo) {
   return (uint64_t)((saddr >> 4) & 0x3FFF) | ((uint64_t)((lbo >> 4) & 0x3FFF) << 16) | ((uint64_t)((sbo >> 4) & 0x3FFF) << 32);
@@ -2348,9 +2448,6 @@ static_assert(WGS_CA[0] > 0 && WGS_CA[7] < 256 && WGS_CB[0] > 0 && WGS_CB[7] < 2
 __device__ __forceinline__ int wgs_cost(int pb, int cnt) {
   return (int)(((pb ? WGS_PB : WGS_PA) >> (8 * (((cnt + 7) >> 3) - 1))) & 255ull);
 }
-#ifndef OKC_WGSPROF
-#define OKC_WGSPROF 0  // dev: per-warpgroup cycle counters (drain, fixup, epilogue) in p.dbg after the timeline slots
-#endif
 #ifndef OKC_WGSREORD
 #define OKC_WGSREORD 1  // WGS: phase A starts with the trailing partial unit (see wgs_split)
 #endif
@@ -3890,50 +3987,24 @@ void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, t
              torch::Tensor tw, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid);
 void okc_set_pdl(int64_t on);
 '''
-# Programmatic dependent launch for embedders whose graph runs this kernel right after other kernels (the kernel
-# waits on griddepcontrol.wait before touching their outputs). Off here: one launch per call gains nothing.
-PDL = False
-# Scale decode with PRMT + IMAD instead of the smem LUT; exact only when every block-scale byte of the local experts
-# is a positive normal e4m3 value (0x08..0x7E). prepare() checks the actual weights and keeps the LUT build otherwise.
-PRMT_SCALES = True
 
 
-def _scales_prmt_exact(*sfs):
-    for sf in sfs:
-        b = sf.contiguous().view(torch.uint8)
-        if bool(((b < 0x08) | (b > 0x7E)).any()):
-            return False
-    return True
-
+# ------------------------------------------------------------------ extension
+# Compiled extensions, keyed by their define tuple. This caches compiled
+# code only -- never weights, activations, or outputs.
 _EXTS = {}
-MAIN_DEFINES = ("-DOKC_NW=16", "-DOKC_FAST1=0", "-DOKC_EPI4=0", "-DOKC_WGS=1")          # compile-time variant used by kernel_fn
-# M <= TINY_MAX_M runs a skinny-only build with 16 warps per CTA (a job never has more than M tokens, so no fat units)
-TINY_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_EPI4=0", "-DOKC_FAST1=2", "-DOKC_L2H=0", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1", "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2", "-DOKC_FINPF=1")  # bf16 WSB at NW=8 + WSBL tail (Oct 26: bs1 +2.5% / +3.5%)
-TINY_MAX_M = 4
-# TINY_MAX_M < M <= TINY2_MAX_M runs a second skinny-only build (empty: skipped); TINY2_MAX_M must stay <= 8
-TINY2_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=1', '-DOKC_FINPF=1')  # bf16 WSB (Oct 26: bs8 +2.0..2.5%)
-TINY2_MAX_M = 8
-# TINY_MAX_M < M <= MID_MAX_M runs MID_DEFINES (empty: the main module)
-MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
-MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
-DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_VARIANTS = {}         # name -> defines, timed in diag mode
-DIAG_BW = False            # also run the bandwidth microbenchmarks
-DIAG_BW_MODES = (5, 8, 12, 16) + tuple(range(17, 25))
-
-
-ALT_SRCS = {}
-MAIN_NS = 3
 
 
 def _ext(defines=None):
+    """Compile (once per define tuple) and return the extension module."""
     defines = tuple(MAIN_DEFINES if defines is None else defines)
     if DQ7 and "-DOKC_DQ7=1" not in defines:
         defines = defines + ("-DOKC_DQ7=1",)
     if defines not in _EXTS:
         src = CUDA_SRC
         defs = [d for d in defines if not d.startswith("@")]
-        if torch.cuda.get_device_capability()[0] < 9:  # small-smem dev GPUs: keep the ring at 1 slot
+        if torch.cuda.get_device_capability()[0] < 9:
+            # Small-smem dev GPUs: keep the ring at 1 slot.
             defs = [d for d in defs if not d.startswith("-DOKC_NS=") and not d.startswith("-DOKC_NSF=")]
         for d in defines:
             if d.startswith("@"):
@@ -3956,17 +4027,24 @@ def _ext(defines=None):
     return _EXTS[defines]
 
 
-# Bit layout of a 32-bit word holding 8 E2M1 codes for one MMA k-step of one lane: register R (0..3) is
-# (h, j0) = (0,0) (1,0) (0,2) (1,2): rows g+8h, k = base + 4s + j0 (+1 for the upper bf16). Code bits (m, e0, e1, s)
-# land at output bits (6, 7, 8, 15) (+16 for the upper half) after the per-register rotation used by dq4().
-_REG_HJ = [(0, 0), (1, 0), (0, 2), (1, 2)]
-
-
-# DQ7: a bit layout whose decode is 7 ALU ops + 2 IMAD.SHL per 8 weights (the kernel gets -DOKC_DQ7=1)
-DQ7 = True
+# ------------------------------------------------------------- weight packing
+def _scales_prmt_exact(*sfs):
+    """True if every scale byte is a positive normal e4m3 value (0x08..0x7E),
+    which is what makes the PRMT scale decode exact."""
+    for sf in sfs:
+        b = sf.contiguous().view(torch.uint8)
+        if bool(((b < 0x08) | (b > 0x7E)).any()):
+            return False
+    return True
 
 
 def _stored_pos():
+    """(register, upper-half, code-bit) -> source bit of the packed word.
+
+    The packers scatter each 4-bit code's bits into a 32-bit word at these
+    positions; the kernel's dq4() rotates them back. The positions must be
+    a permutation of 0..31, which the assert checks.
+    """
     pos = {}
     for R in range(4):
         for up in range(2):
@@ -3992,12 +4070,27 @@ def _stored_pos():
 _POS = _stored_pos()
 
 
+def _split_nibbles(codes, rows):
+    """Packed uint8 codes (2 per byte) for the given rows -> (nibbles, R).
+
+    nibbles is [R, K]: one 4-bit E2M1 code per entry, low nibble first.
+    """
+    c = codes.index_select(0, rows)
+    nib = torch.stack((c & 0xF, c >> 4), -1).reshape(c.shape[0], -1)
+    return nib, c.shape[0]
+
+
+def _scatter_code_bits(word, code, reg, up):
+    """OR one code's 4 bits into `word` at the positions for (reg, up)."""
+    for b in range(4):
+        word |= ((code >> b) & 1) << _POS[(reg, up, b)]
+    return word
+
+
 def _pack_codes(codes, rows):
     """codes uint8 [R0, K/2] (one expert), rows: LongTensor row order (R). Returns int32 words
     laid out [rb][w][c][g][t][s] (uint4 per lane per chunk)."""
-    c = codes.index_select(0, rows)
-    R = c.shape[0]
-    nib = torch.stack((c & 0xF, c >> 4), -1).reshape(R, -1)  # [R, K]
+    nib, R = _split_nibbles(codes, rows)
     nb = R // 16
     n = nib.view(nb, 2, 8, 8, 8, 4, 4, 4)  # rb, h, g, w, c, t, s, j
     n = n.permute(0, 3, 4, 2, 5, 6, 1, 7).to(torch.int64)  # rb, w, c, g, t, s, h, j
@@ -4005,8 +4098,7 @@ def _pack_codes(codes, rows):
     for Rg, (h, j0) in enumerate(_REG_HJ):
         for up in range(2):
             code = n[..., h, j0 + up]
-            for b in range(4):
-                word |= ((code >> b) & 1) << _POS[(Rg, up, b)]
+            word = _scatter_code_bits(word, code, Rg, up)
     word = torch.where(word >= 2**31, word - 2**32, word).to(torch.int32)
     return word.contiguous().view(-1)
 
@@ -4042,9 +4134,7 @@ def _unit_order(codes, scales):
 def _pack_codes_nat(codes, rows):
     """Like _pack_codes but with the natural mma k order inside each 16-k step (for the wgmma fat path):
     word (rb, w, c, g, t, s) holds k = 64c + 16s + 8q + 2t + e of rows g (h=0) / g+8 (h=1)."""
-    c = codes.index_select(0, rows)
-    R = c.shape[0]
-    nib = torch.stack((c & 0xF, c >> 4), -1).reshape(R, -1)  # [R, K]
+    nib, R = _split_nibbles(codes, rows)
     nb = R // 16
     n = nib.view(nb, 2, 8, 8, 8, 4, 2, 4, 2)  # rb, h, g, w, c, s, q, t, e
     n = n.permute(0, 3, 4, 2, 7, 5, 1, 6, 8).to(torch.int64)  # rb, w, c, g, t, s, h, q, e
@@ -4052,8 +4142,7 @@ def _pack_codes_nat(codes, rows):
     for Rg, (h, q) in enumerate(((0, 0), (1, 0), (0, 1), (1, 1))):
         for up in range(2):
             code = n[..., h, q, up]
-            for b in range(4):
-                word |= ((code >> b) & 1) << _POS[(Rg, up, b)]
+            word = _scatter_code_bits(word, code, Rg, up)
     word = torch.where(word >= 2**31, word - 2**32, word).to(torch.int32)
     return word.contiguous().view(-1)
 
@@ -4076,29 +4165,34 @@ def _wgs_copy(codes, sf, rows):
     return torch.cat([cb, s], dim=3).contiguous().view(-1)
 
 
-# the M >= 64 build when the scale bytes rule out the PRMT decode (the WGS kernel needs it): the mma.sync kernel
-MAIN_FALLBACK_DEFINES = ("-DOKC_CPF=0", "-DOKC_CPFF=0", "-DOKC_DYNK=7", "-DOKC_EARLYN=2", "-DOKC_EPI4=0", "-DOKC_FCOSTB=35",
-                         "-DOKC_FCOSTBB=36", "-DOKC_FINCOL=0", "-DOKC_FPF=5")
-
-
 def _main_defines(sfx):
+    """The MAIN variant's defines for this weight set: the WGS build needs
+    the PRMT scale decode, so without it fall back to the mma.sync build."""
     if not sfx and "-DOKC_WGS=1" in tuple(MAIN_DEFINES):
         return MAIN_FALLBACK_DEFINES
     return MAIN_DEFINES
 
 
 def _wgs_on():
+    """True if any compiled variant uses the WGS (RS-wgmma) kernel, which
+    needs the extra WGS weight copies in state["w"]."""
     return any("-DOKC_WGS=1" in tuple(d) for d in (MAIN_DEFINES, TINY_DEFINES, TINY2_DEFINES, MID_DEFINES))
 
 
+# ---------------------------------------------------------------------- setup
 def prepare(weights):
+    """Repack weights (bit/byte permutations only, never requantized) into
+    the layouts the kernel reads, allocate scratch, and compile the
+    variants kernel_fn may pick. Called once; not on the timed path."""
     dev = weights["w13"].device
-    lo, cnt = 0, 32
-    I = weights["w13"].shape[1] // 2
-    H = weights["w2"].shape[1]
-    assert I == 4096 and H == 4096
+    lo, cnt = LOCAL_START, LOCAL_EXPERTS
+    I = weights["w13"].shape[1] // 2   # gate+up rows: w13 stacks [gate; up]
+    H = weights["w2"].shape[1]         # down rows
+    assert I == HIDDEN and H == HIDDEN
     assert weights["post_norm_w"].dtype == torch.bfloat16  # kept as given (TASK.md: BF16 weights stay BF16)
     assert weights["w13_gs"].dtype == torch.float32 and weights["w2_gs"].dtype == torch.float32  # stored as given
+    # rowsA: gate rows and up rows interleaved in 8-row groups (the mma
+    # row-group size); rowsB: down rows in order.
     rb = torch.arange(I // 8, device=dev)
     g = torch.arange(8, device=dev)
     rowsA = torch.stack((8 * rb[:, None] + g[None, :], I + 8 * rb[:, None] + g[None, :]), 1).reshape(-1)
@@ -4109,13 +4203,20 @@ def prepare(weights):
         sA.append(_pack_scales(weights["w13_sf"][e], rowsA))
         wB.append(_pack_codes(weights["w2"][e], rowsB))
         sB.append(_pack_scales(weights["w2_sf"][e], rowsB))
+    # LUT: fp8 e4m3 byte -> bf16x2(value * 2^64), packed into one int32.
     lut = (torch.arange(256, dtype=torch.int32, device=dev).to(torch.uint8).view(torch.float8_e4m3fn).float()
            * 2.0**64).to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     lut = (lut | (lut << 16)).to(torch.int32)
     state = {
+        # w: [packed gate/up codes, scales, group scales,
+        #     packed down codes, scales, group scales,
+        #     e4m3 LUT, post_norm_w (bf16 as given; kernel forms 1 + w in FP32),
+        #     fat-order gate/up, fat-order down,
+        #     unit-order gate/up, unit-order down,
+        #     (+ WGS copies appended below, w[12] / w[13], when any variant uses WGS)]
         "w": [torch.cat(wA), torch.cat(sA), weights["w13_gs"][lo:lo + cnt].contiguous(),
               torch.cat(wB), torch.cat(sB), weights["w2_gs"][lo:lo + cnt].contiguous(),
-              lut.contiguous(), weights["post_norm_w"].contiguous(),  # bf16 as given; the kernel forms 1 + w in FP32
+              lut.contiguous(), weights["post_norm_w"].contiguous(),
               torch.cat([_fat_order(a, b) for a, b in zip(wA, sA)]), torch.cat([_fat_order(a, b) for a, b in zip(wB, sB)]),
               torch.cat([_unit_order(a, b) for a, b in zip(wA, sA)]), torch.cat([_unit_order(a, b) for a, b in zip(wB, sB)])],
         "lo": lo, "cnt": cnt, "scratch": _make_scratch(dev),
@@ -4138,22 +4239,27 @@ def prepare(weights):
     return state
 
 
-MMAX = 384
-EMAX = MMAX * 8
-JMAX = 32 + EMAX // 64 + 8
-
-
-WGS_FIXF = 2 * 160 * 4 * 4096 + 2 * 160 * 4 + 136 * 16   # moe WGS_FIXF: stream-K fixups + doneAs after ybuf (zero between calls)
-WGS_XROWS = EMAX + 8 * (32 + EMAX // 32 + 8)  # >= moe WGS_XROWS for FT_T >= 32
-
-
 def _make_scratch(dev):
-    return [torch.zeros(8 + 1024 + EMAX, dtype=torch.int32, device=dev),  # counters + doneA (>= any build's JMAX) + ss copy 1
-            torch.zeros(EMAX + EMAX * 4096 + WGS_FIXF, dtype=torch.float32, device=dev),
-            torch.zeros((EMAX + 2 * WGS_XROWS) * 4096, dtype=torch.bfloat16, device=dev)]  # inter, then WGS xA / xB
+    """Per-call scratch, sized for CHUNK_TOKENS tokens. Layout is fixed by
+    the CUDA launcher (okc_run), which indexes scratch[0]/[1]/[2] as:
+    [0] int32: 8 counters + 1024 doneA slots + the second ss copy
+    (ss1, EMAX floats viewed as int32 -- the launcher takes its address
+    as ib + 8 + 1024);
+    [1] fp32: ss (EMAX) + ybuf (EMAX x HIDDEN) + WGS stream-K fixups;
+    [2] bf16: inter (EMAX x HIDDEN) + WGS xA / xB (2 x WGS_XROWS x HIDDEN).
+    Zeroed here so the first call starts from a clean grid barrier state;
+    the kernel re-zeroes what it needs between launches.
+    """
+    return [torch.zeros(8 + 1024 + EMAX, dtype=torch.int32, device=dev),
+            torch.zeros(EMAX + EMAX * HIDDEN + WGS_FIXF, dtype=torch.float32, device=dev),
+            torch.zeros((EMAX + 2 * WGS_XROWS) * HIDDEN, dtype=torch.bfloat16, device=dev)]
 
 
+# ------------------------------------------------------------------ timed path
 def kernel_fn(data, state):
+    """Run one MoE layer. Fresh output every call; no host syncs; the only
+    per-call work is picking the compiled variant by token count and
+    launching it in CHUNK_TOKENS-token slices."""
     cfg = data["config"]
     x = data["hidden_states"].contiguous()
     M = x.shape[0]
@@ -4162,7 +4268,7 @@ def kernel_fn(data, state):
     if ids.data_ptr() & 15:  # the WGS routing loads topk_ids 16 B at a time (an offset view gets an aligned copy)
         ids = ids.clone()
     tw = data["topk_weights"].to(torch.float32).contiguous()
-    out = torch.empty((M, 4096), dtype=torch.bfloat16, device=x.device)
+    out = torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=x.device)
     sfx = state.get("sfx", ())
     if TINY_DEFINES and M <= TINY_MAX_M:
         ext = _ext(tuple(TINY_DEFINES) + sfx)
@@ -4172,33 +4278,38 @@ def kernel_fn(data, state):
         ext = _ext(tuple(MID_DEFINES) + sfx)
     else:
         ext = _ext(tuple(_main_defines(sfx)) + sfx)
-    for m0 in range(0, M, MMAX):
-        m1 = min(M, m0 + MMAX)
+    for m0 in range(0, M, CHUNK_TOKENS):
+        m1 = min(M, m0 + CHUNK_TOKENS)
         ext.okc_run(state["w"], state["scratch"], x[m0:m1], ids[m0:m1], tw[m0:m1], out[m0:m1],
                     state["lo"], state["cnt"], state["grid"])
     return out
 
 
 # ---------------------------------------------------------------------------------------------- diagnostics
+# Everything below runs only when DIAG is set (prepare) or when called
+# directly. It is development tooling, not part of the submission's timed
+# path, and it is the only place host synchronisation appears besides
+# prepare()'s one-time compile wait.
 def _gen_input(bs, seed, dev):
     """Same distribution as the task's generate_input (normal dist, busiest-GPU relabel), written here."""
     gen = torch.Generator(device=dev).manual_seed(seed)
-    x = torch.randn((bs, 4096), generator=gen, device=dev).to(torch.bfloat16)
-    scores = torch.rand((bs, 256), generator=gen, device=dev)
-    z = torch.randn((256,), generator=gen, device=dev)
-    u = torch.rand((256,), generator=gen, device=dev).clamp(min=1e-12)
+    x = torch.randn((bs, HIDDEN), generator=gen, device=dev).to(torch.bfloat16)
+    scores = torch.rand((bs, N_EXPERTS_TOTAL), generator=gen, device=dev)
+    z = torch.randn((N_EXPERTS_TOTAL,), generator=gen, device=dev)
+    u = torch.rand((N_EXPERTS_TOTAL,), generator=gen, device=dev).clamp(min=1e-12)
     scores = scores + 0.03 * z / (-u.log()).sqrt()
-    routed = scores.topk(8, dim=-1)
+    routed = scores.topk(TOP_K, dim=-1)
     ids = routed.indices
-    pairs = torch.bincount((ids // 32).flatten(), minlength=8)
-    ids = (ids - 32 * pairs.argmax()) % 256
+    pairs = torch.bincount((ids // LOCAL_EXPERTS).flatten(), minlength=TOP_K)
+    ids = (ids - LOCAL_EXPERTS * pairs.argmax()) % N_EXPERTS_TOTAL
     return {"hidden_states": x, "topk_ids": ids.to(torch.int32),
             "topk_weights": (routed.values / routed.values.sum(-1, keepdim=True)).float(),
-            "config": {"bs": bs, "d_hidden": 4096, "d_expert": 4096, "n_experts": 256, "local_start": 0,
-                       "local_count": 32, "top_k": 8, "sharding": "ep8"}}
+            "config": {"bs": bs, "d_hidden": HIDDEN, "d_expert": HIDDEN, "n_experts": N_EXPERTS_TOTAL, "local_start": LOCAL_START,
+                       "local_count": LOCAL_EXPERTS, "top_k": TOP_K, "sharding": SHARDING}}
 
 
 def _time_graph(fn, reps=40):
+    """Median / min CUDA-graph replay time of fn in microseconds."""
     dev = torch.device("cuda")
     flush = torch.empty(64 * 1024 * 1024, dtype=torch.int32, device=dev)
     s = torch.cuda.Stream()
@@ -4279,19 +4390,21 @@ def _diag(state, weights):
     for bs in shapes:
         d = _gen_input(bs, 1234 + bs, dev)
         ids = d["topk_ids"]
-        touched = int(torch.unique(ids[(ids >= 0) & (ids < 32)]).numel())
+        touched = int(torch.unique(ids[(ids >= 0) & (ids < LOCAL_EXPERTS)]).numel())
         row = [f"bs={bs:3d} touched={touched:2d}"]
         for name, defs in variants.items():
             ext = _ext(defs)
             x = d["hidden_states"]
             idt = ids.to(torch.int32).contiguous()
             tw = d["topk_weights"].float().contiguous()
-            out = torch.empty((bs, 4096), dtype=torch.bfloat16, device=dev)
+            out = torch.empty((bs, HIDDEN), dtype=torch.bfloat16, device=dev)
 
             def fn():
-                ext.okc_run(state["w"], state["scratch"], x, idt, tw, out, 0, 32, state["grid"])
+                ext.okc_run(state["w"], state["scratch"], x, idt, tw, out, LOCAL_START, LOCAL_EXPERTS, state["grid"])
 
             med, mn = _time_graph(fn)
+            # 28.31 MB: approx. weight bytes streamed per touched expert
+            # (NVFP4 codes + scales for gate/up + down), diagnostic only.
             row.append(f"{name}: {med:7.1f}us ({touched * 28.31 / med:4.2f} TB/s)")
         lines.append("  ".join(row))
         print("[diag] " + lines[-1], flush=True)
@@ -4307,13 +4420,13 @@ def _diag(state, weights):
             x = d["hidden_states"]
             idt = d["topk_ids"].to(torch.int32).contiguous()
             tw = d["topk_weights"].float().contiguous()
-            out = torch.empty((bs, 4096), dtype=torch.bfloat16, device=dev)
+            out = torch.empty((bs, HIDDEN), dtype=torch.bfloat16, device=dev)
             flush = torch.empty(64 * 1024 * 1024, dtype=torch.int32, device=dev)
             for _ in range(3):
                 flush.add_(1)
                 dbg.zero_()
                 torch.cuda.synchronize()
-                ext.okc_run(state["w"], sc, x, idt, tw, out, 0, 32, G)
+                ext.okc_run(state["w"], sc, x, idt, tw, out, LOCAL_START, LOCAL_EXPERTS, G)
                 torch.cuda.synchronize()
             tt = dbg[:G * 8].view(G, 8).cpu().double()
             t00 = tt[:, 0][tt[:, 0] > 0].min()

@@ -2,33 +2,120 @@
 """Dense projections for Muse Spark Open: skinny swap-AB tensor-core GEMV/GEMM with
 losslessly compressed BF16 weights.
 
-out[m, n] = x[m, k] @ W[n, k]^T.  For m <= 64 every weight byte is streamed once from HBM
-straight into registers, in mma.m16n8k16 A-fragment order (prepared once), and multiplied
-against x (staged in shared memory) on BF16 tensor cores with FP32 accumulation.
+Math
+----
+``out[m, n] = x[m, k] @ W[n, k]^T`` for the five projection matrices of one
+model (``qkv_gate``, ``o``, ``pooler``, ``unpooler``, ``router``). The router's
+FP32 weights run as a BF16 hi + lo pair concatenated along K with FP32
+accumulation, as SGLang does above 8 tokens.
 
-Lossless 12-bit weights (BF16 projections): each BF16 weight is stored as its low byte
-(exponent bit 0 + 7 mantissa bits, raw) and a 4-bit code for its high byte (sign + exponent
-bits 7..1, as an offset into an 8-value window chosen per matrix).  The kernel rebuilds the
-exact BF16 bits in registers (a few integer ops per weight).  The rare weights whose exponent
-falls outside the window (tiny magnitudes) are exact-corrected: the kernel adds
-x[:, k] * (w - w_decoded) for each of them (both factors exact in FP32), so every output
+Lossless 12-bit weights (BF16 projections)
+-------------------------------------------
+Each BF16 weight is stored as its low byte (exponent bit 0 + 7 mantissa bits,
+raw) and a 4-bit code for its high byte (sign + exponent bits 7..1, as an
+offset into an 8-value window chosen per matrix, the window covering the most
+weights). The kernel rebuilds the exact BF16 bits in registers (a few integer
+ops per weight). The rare weights whose exponent falls outside the window
+(tiny magnitudes) are exact-corrected: the kernel adds ``x[:, k] * (w -
+w_decoded)`` for each of them (both factors exact in FP32), so every output
 equals the product with the original weights up to FP32 accumulation order.
+``prepare()`` rejects a packing whose escape share exceeds
+``1 / MAX_ESCAPE_DENOMINATOR`` or whose correction is not exact in FP32, and
+falls back to uncompressed fragments.
 
-Split-K across warps (shared-memory reduction) and across CTAs (FP32 partials + a
-self-resetting semaphore; the last CTA of a row block reduces) keeps ~128 CTAs streaming on
-every shape.  The router's FP32 weights run as a BF16 hi + lo pair (concatenated along K)
-with FP32 accumulation, as SGLang does above 8 tokens.
+Why the kernels look the way they do
+------------------------------------
+Weights dominate: for m <= 64 every weight byte is streamed once from HBM
+straight into registers, in mma.m16n8k16 fragment order (prepared once), and
+multiplied against x (staged in shared memory) on BF16 tensor cores with FP32
+accumulation. Split-K across warps (shared-memory reduction) and across CTAs
+(FP32 partials + a self-resetting semaphore; the last CTA of a row block
+reduces) keeps ~128 CTAs streaming on every shape.
+
+Routes (chosen per layer and token count m by ``_static_choice`` / ``_autotune``)
+---------------------------------------------------------------------------------
+* ``sk2`` -- m <= 32, swapped operands, no cross-CTA reduction (the production
+  skinny path on sm_90). ``skinny`` (TMA-streamed tensor-core GEMV) is the
+  fallback / pre-sk2 path, kept for non-sm_90 and as the autotuner's
+  alternative.
+* ``cgemv`` / ``sgemv`` / ``rgemv`` -- m == 1 scalar GEMV specialists.
+* ``wide`` / ``gemm`` / ``gq`` / ``gqx`` -- m 33..256 TMA + wgmma GEMMs
+  (``wide`` is the BF16 route; the router uses ``wide``/``gemm``/``rk``).
+* ``rk`` -- router-only split-K GEMM (order-dependent FP32 adds, inside the
+  router tolerance).
+* ``cutlass`` -- CUTLASS pingpong GEMM, pooler m == 256 only, built in the
+  background during ``prepare()``; a failed build just drops the route.
+* ``torch`` / ``torchT`` -- cuBLAS fallbacks (``F.linear`` / ``mm`` on a
+  K-major copy). Any custom path that fails ``_selftest`` is disabled in
+  favour of cuBLAS.
+
+Design of this file
+--------------------
+* One Python file; native CUDA only, compiled once by
+  ``torch.utils.cpp_extension.load_inline`` (``_get_ext`` / ``_build_cutlass``).
+* The CUDA sources are string constants, kept verbatim: the kernels, tile
+  sizes, and launch configs in them are the tuned behaviour and are not
+  touched by this refactor. Python only assembles dispatch tables into them
+  (``@@PLACEHOLDER@@``) and prepares their inputs.
+* ``prepare(weights)`` builds every weight layout once (compressed streams,
+  escape tables, workspaces) into ``state``; ``kernel_fn(data, state)`` runs
+  one projection. Fresh outputs are allocated on every call; nothing is
+  cached across calls except the compiled extensions and the per-shape
+  autotune choice in ``state``.
+* CUDA-graph capturable: the timed paths perform no host synchronisation
+  (``_selftest`` / ``_autotune`` synchronise only during ``prepare()``).
+* Config tables live next to the kernel they configure. Constants that more
+  than one helper needs live in the "Shared constants" section below.
 """
 
+import importlib.util
+import os
+import sys
+import threading
 from typing import TypedDict
 
 import torch
 import torch.nn.functional as F
-import sys
 
 from torch.utils.cpp_extension import load_inline
-import os as _os
-_SK2_DELAY = int(_os.environ.get("SK2_DELAY_ESC", "0"))   # debug only: one random escape warp per CTA stalls this many ns at a random stage; ring waits trap after 2 s
+
+# Debug only, from the environment: one random escape warp per CTA stalls this
+# many ns at a random stage; ring waits trap after 2 s.
+_SK2_DELAY = int(os.environ.get("SK2_DELAY_ESC", "0"))
+
+
+# ---------------------------------------------------------------------------
+# Shared constants (tuning numbers used by more than one helper)
+# ---------------------------------------------------------------------------
+# Lossless 12-bit packing: an exponent window of EXPONENT_WINDOW consecutive
+# exponent values, picked per matrix to cover the most weights.
+EXPONENT_WINDOW = 8
+EXPONENT_VALUES = 128  # distinct values of BF16 exponent bits 7..1
+# Packing is rejected when more than this share of weights escapes the window.
+MAX_ESCAPE_DENOMINATOR = 200
+# base4 packs one window base byte into each byte of a uint32 (see decode8).
+BASE4_REPLICATE = 0x01010101
+# Stage-count clamps for the TMA skinny kernel's pipeline.
+TMA_MIN_STAGES = 2
+TMA_MAX_STAGES = 8
+# sm_90 / sm_80 shared-memory budgets (bytes) for that pipeline.
+SM90_SMEM_BUDGET_BYTES = 112 * 1024
+SM80_SMEM_BUDGET_BYTES = 40 * 1024
+# Stage-count clamps for the sk2 kernel's ring.
+SK2_MIN_STAGES = 2
+SK2_MAX_STAGES = 16
+# Failure seeds keep selftest / autotune reproducible across runs.
+SELFTEST_SEED = 1234
+AUTOTUNE_SEED = 4321
+AUTOTUNE_REPS = 24
+# Autotune replays from a cold L2: this read sweep is larger than L2.
+L2_FLUSH_ROWS = 65_536  # 65_536 x 1024 float32 = 256 MiB
+# sk2 ring sizing: a config name ending in _rNNN caps the ring at NNN KiB,
+# otherwise the default applies; the ring also never exceeds the smem budget
+# left after the rest of the kernel's shared-memory layout.
+SK2_DEFAULT_RING_CAP_KB = 200
+SK2_RING_SMEM_BUDGET_BYTES = 232_448
+
 
 
 class Weights(TypedDict):
@@ -51,6 +138,12 @@ class Inputs(TypedDict):
     config: Config
 
 
+# ---------------------------------------------------------------------------
+# CUDA sources. These string constants are the kernels, verbatim: tile sizes,
+# launch configs, and numerics in them are the tuned behaviour. Each kernel's
+# config table and dispatch builder live next to its source below; @@...@@
+# placeholders are filled by the builder for that route.
+# ---------------------------------------------------------------------------
 CUDA_SRC = r"""
 #include <ATen/core/Tensor.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -216,8 +309,8 @@ __device__ __forceinline__ uint64_t make_desc_sw128(uint32_t saddr) {
 """
 
 
-def wgmma_defs(bns):
-    """Generate wgmma_call overloads for m64nBNk16 bf16 with A from registers."""
+def wgmma_rs_defs(bns):
+    """Generate wgmma_bn (register-sourced A) overloads for m64nBNk16 bf16."""
     out = []
     for bn in bns:
         nacc = bn // 2
@@ -1879,44 +1972,19 @@ void gqx(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t M, int64_t
 void rk(torch::Tensor Wc, torch::Tensor x, torch::Tensor out, int64_t S, torch::Tensor zc);
 """
 
-# (layer, mt) -> (splits, RG, WS); grid = (N / (16 RG), splits) ~ 128 CTAs
-CONFIGS = {
-    ("pooler", 1): (1, 2, 8), ("pooler", 2): (2, 4, 4), ("pooler", 4): (4, 8, 2), ("pooler", 8): (16, 8, 1),
-    ("unpooler", 1): (2, 1, 8), ("unpooler", 2): (1, 4, 4), ("unpooler", 4): (2, 8, 2), ("unpooler", 8): (8, 8, 1),
-    ("qkv_gate", 1): (8, 9, 2), ("qkv_gate", 2): (8, 9, 2), ("qkv_gate", 4): (8, 9, 1), ("qkv_gate", 8): (16, 9, 1),
-    ("o", 1): (1, 4, 4), ("o", 2): (1, 4, 4), ("o", 4): (1, 4, 4), ("o", 8): (2, 8, 1),
-    ("router", 1): (8, 1, 8), ("router", 2): (8, 1, 8), ("router", 4): (8, 1, 8), ("router", 8): (16, 1, 4),
-}
-MAX_SKINNY_M = 32
-w_rows = {"qkv_gate": 2304, "o": 8192, "pooler": 4096, "unpooler": 8192, "router": 256}
-COMPRESS = {"qkv_gate", "o", "pooler", "unpooler"}
-D_PLAIN = 16
-D_COMP = 12
-PF = 0
+# Weight rows per layer (the full matrices; some routes run on a prefix, e.g.
+# the unpooler slice at m <= 8).
+WEIGHT_ROWS = {"qkv_gate": 2304, "o": 8192, "pooler": 4096, "unpooler": 8192, "router": 256}
+COMPRESSED_LAYERS = {"qkv_gate", "o", "pooler", "unpooler"}
+# At small m the unpooler runs on its first rows only (the slice SGLang scores).
+UNPOOLER_SLICE_ROWS = 1024
 
 _ext = None
 
 
-def _dispatch_src():
-    return ""  # LDG skinny kernel unused in v6 (TMA path); keep the template uninstantiated
-    lines = []
-    for (layer, mt), (splits, rg, wsn) in sorted(CONFIGS.items()):
-        f32 = layer == "router"
-        ot = "float" if f32 else "__nv_bfloat16"
-        for comp in ((0,) if f32 else (0, 1)):
-            d = D_COMP if comp else (D_PLAIN if rg * wsn <= 9 and mt <= 4 else 8)
-            lines.append(f"if (mt == {mt} && rg == {rg} && wsn == {wsn} && comp == {comp} && out_f32 == {str(f32).lower()}) "
-                         f"{{ launch<{mt}, {rg}, {wsn}, {d}, {str(bool(comp)).lower()}, {PF}, {ot}>(Wp, x, out, ws, counters, "
-                         f"poff, pk, pr, pd, base4, M, N, Kp, Kx, splits, nrg); return; }}")
-    return "\n  ".join(dict.fromkeys(lines))
-
-
-MID_CONFIGS = {  # (layer, bn) -> (nwg, splits); grid = (N / (64 nwg), splits) <= 132 CTAs (co-resident)
-    ("pooler", 128): (2, 4), ("unpooler", 128): (2, 2), ("qkv_gate", 128): (2, 7), ("o", 128): (2, 2),
-    ("router", 128): (2, 64),
-    ("pooler", 256): (2, 4), ("unpooler", 256): (2, 2), ("qkv_gate", 256): (2, 7), ("o", 256): (2, 2),
-    ("router", 256): (2, 64),
-}
+# ---------------------------------------------------------------------------
+# Skinny (TMA) route config
+# ---------------------------------------------------------------------------
 TMA_CONFIGS = {  # (layer, mt) -> (splits, RG, WS, KS); x chunk M*Kc*2 small, ~128 CTAs; mt 0 = m == 1
     ("pooler", 0): (1, 2, 8, 4), ("pooler", 1): (2, 4, 4, 4), ("pooler", 2): (4, 8, 2, 4), ("pooler", 4): (8, 16, 1, 4),
     ("unpooler", 0): (2, 1, 8, 4), ("unpooler", 1): (2, 1, 8, 4), ("unpooler", 2): (2, 8, 2, 4), ("unpooler", 4): (4, 16, 1, 4),
@@ -1924,19 +1992,15 @@ TMA_CONFIGS = {  # (layer, mt) -> (splits, RG, WS, KS); x chunk M*Kc*2 small, ~1
     ("o", 0): (1, 4, 4, 4), ("o", 1): (1, 4, 4, 4), ("o", 2): (1, 4, 4, 4), ("o", 4): (1, 4, 4, 4),
     ("router", 0): (8, 1, 8, 4), ("router", 1): (8, 1, 8, 4), ("router", 2): (8, 1, 8, 4), ("router", 4): (8, 1, 8, 4),
 }
-TMA_KS = 4
-USE_TMA = True
 USE_WGM = True   # m >= 9 compressed configs with RG % 4 == 0 use RS-wgmma (sm_90)
 WGM_SM80_TEST = False  # local check of the wgmma path's data layout (mma.sync emulation on sm_80)
 
 
 def _tma_nstage(nw, comp, sm90, ks, hl=False):
+    """Pipeline stages for a skinny config: as many as fit the smem budget."""
     chunk = (ks // 4) * 1536 if comp else ks * 512 * (2 if hl else 1)
-    budget = (112 if sm90 else 40) * 1024
-    return max(2, min(8, budget // (nw * chunk)))
-
-
-TMA_TU = {}  # (layer, mtk) -> 0 / 1 (which translation unit instantiates it)
+    budget = SM90_SMEM_BUDGET_BYTES if sm90 else SM80_SMEM_BUDGET_BYTES
+    return max(TMA_MIN_STAGES, min(TMA_MAX_STAGES, budget // (nw * chunk)))
 
 
 # alternative skinny configs (more splits -> fewer x bytes per CTA); the prepare()-time autotuner times them
@@ -1967,17 +2031,13 @@ def _tma_srcs(sm90):
         ns = _tma_nstage(rg * wsn, comp, sm90, ks, hl)
         if f32 and mt >= 4:
             ns = min(ns, 3)  # x chunk (32 x 1024) + ring must fit in shared memory
-        n_cfg = 1024 if (layer == "unpooler" and mtk <= 1) else w_rows[layer]
+        n_cfg = UNPOOLER_SLICE_ROWS if (layer == "unpooler" and mtk <= 1) else WEIGHT_ROWS[layer]
         wgm = bool((sm90 or WGM_SM80_TEST) and comp and USE_WGM and rg % 4 == 0 and mtk >= 2)
         line = (f"if (mt == {mt} && rg == {rg} && wsn == {wsn} && ks == {ks} && comp == {comp} && out_f32 == {str(f32).lower()}) "
                 f"{{ launch_tma<{mt}, {rg}, {wsn}, {ks}, {ns}, {str(bool(comp)).lower()}, {str(hl).lower()}, {str(wgm).lower()}, {ot}>(Wp, x, out, ws, "
                 f"counters, ptab, pmax, base4, M, N, Kp, Kx, splits, nrg, (int)dg); return; }}")
         lines.setdefault(line, []).append(key)
-    keys = list(lines)
-    for ln in keys:
-        for cfg in lines[ln]:
-            TMA_TU[cfg] = 0
-    return TMA_SRC.replace("@@TMA_DISPATCH@@", "\n  ".join(keys)).replace("@@TMA_NAME@@", "skinny_tma_a")
+    return TMA_SRC.replace("@@TMA_DISPATCH@@", "\n  ".join(lines)).replace("@@TMA_NAME@@", "skinny_tma_a")
 
 
 GEMM_CONFIGS = {  # (layer, bn) -> (nwg, splits, stages); grid = (N / (64 nwg), splits) <= 132 (co-resident)
@@ -2500,11 +2560,18 @@ def _gqx_bn(m):
     return 128 if m <= 128 else 256
 
 
-def _run_gqx(x, layer, m, n, k, state):
-    nwg, cl, ns = GQX_CONFIGS[(layer, _gqx_bn(m))]
+def _run_gq_family(x, layer, m, n, k, state, configs, bn_of_m, method):
+    """Run a gq/gqx cluster GEMM: same call shape, different config table and
+    entry point (gq = plain BF16 weights, gqx = big tiles)."""
+    bn = bn_of_m(m)
+    nwg, cl, ns = configs[(layer, bn)]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    _get_ext().gqx(state["raw"][layer], x, out, m, n, k, _gqx_bn(m), nwg, cl, ns)
+    getattr(_get_ext(), method)(state["raw"][layer], x, out, m, n, k, bn, nwg, cl, ns)
     return out
+
+
+def _run_gqx(x, layer, m, n, k, state):
+    return _run_gq_family(x, layer, m, n, k, state, GQX_CONFIGS, _gqx_bn, "gqx")
 
 
 
@@ -2791,10 +2858,7 @@ def _gq_bn(m):
 
 
 def _run_gq(x, layer, m, n, k, state):
-    nwg, cl, ns = GQ_CONFIGS[(layer, _gq_bn(m))]
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    _get_ext().gq(state["raw"][layer], x, out, m, n, k, _gq_bn(m), nwg, cl, ns)
-    return out
+    return _run_gq_family(x, layer, m, n, k, state, GQ_CONFIGS, _gq_bn, "gq")
 
 
 
@@ -2822,28 +2886,6 @@ def _wide_src(sm90):
                      f"{{ launch_wide<{nwg}, {tok}, {stages}, {str(hl).lower()}, {ot}>(Wst, x, out, ws, counters, ptab, pmax, base4, "
                      f"M, N, K, splits); return; }}")
     return WIDE_SRC.replace("@@WIDE_DISPATCH@@", "\n  ".join(dict.fromkeys(lines)))
-
-
-MID_STAGES = 4
-MID_DU = 2
-
-
-def _mid_src(sm90):
-    if not sm90:
-        return ('void mid(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, '
-                'torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, '
-                'int64_t, int64_t, int64_t, int64_t) { TORCH_CHECK(false, "mid needs sm_90"); }')
-    lines = []
-    for (layer, bn), (nwg, splits) in []:
-        f32 = layer == "router"
-        ot = "float" if f32 else "__nv_bfloat16"
-        for comp in ((0,) if f32 else (0, 1)):
-            lines.append(f"if (nwg == {nwg} && bn == {bn} && comp == {comp} && out_f32 == {str(f32).lower()}) "
-                         f"{{ launch_mid<{nwg}, {bn}, {MID_STAGES}, {MID_DU}, {str(bool(comp)).lower()}, {ot}>(Wp, x, out, ws, "
-                         f"counters, poff, pk, pr, pd, base4, M, N, Kp, Kx, splits, nrg); return; }}")
-    bns = sorted({bn for (_, bn) in MID_CONFIGS})
-    return (MID_SRC.replace("@@WGMMA_DEFS@@", wgmma_defs(bns))
-            .replace("@@MID_DISPATCH@@", "\n  ".join(dict.fromkeys(lines))))
 
 
 RK_SRC = r"""
@@ -3035,18 +3077,28 @@ def _rk_src(sm90):
     return 'void rk(at::Tensor, at::Tensor, at::Tensor, int64_t, at::Tensor) { TORCH_CHECK(false, "rk needs sm_90"); }'
 
 
+# ---------------------------------------------------------------------------
+# Extension build: everything above is assembled into one CUDA translation
+# unit here. On non-sm_90 the sm_90-only routes compile to TORCH_CHECK stubs.
+# ---------------------------------------------------------------------------
 def _get_ext():
-    """Compile everything as one CUDA translation unit with load_inline.  no_implicit_headers: the CUDA file includes
-    only the ATen headers it needs (torch/types.h alone costs ~45 s of nvcc time)."""
+    """Compile everything as one CUDA translation unit with load_inline.
+
+    no_implicit_headers: the CUDA file includes only the ATen headers it needs
+    (torch/types.h alone costs ~45 s of nvcc time).
+    """
     global _ext
     if _ext is None:
         major, minor = torch.cuda.get_device_capability()
         sm90 = major >= 9
         arch = f"{major}{minor}a" if sm90 else f"{major}{minor}"
-        common = CUDA_SRC.replace("@@MBAR@@", MBAR_HELPERS).replace("@@BODY@@", WG_HELPERS if sm90 else "")
-        defs = wgmma_defs([8, 16, 32, 64, 128]) if sm90 else ""
-        cuda_src = (common + defs + _tma_srcs(sm90) + MAP_SRC + _gemm_src(sm90) + _wide_src(sm90) + _sk2_src(sm90)
-                    + _gq_src(sm90) + _gqx_src(sm90) + RGEMV_SRC + _rk_src(sm90))
+        skinny = CUDA_SRC.replace("@@MBAR@@", MBAR_HELPERS).replace("@@BODY@@", WG_HELPERS if sm90 else "")
+        rs_defs = wgmma_rs_defs([8, 16, 32, 64, 128]) if sm90 else ""
+        # Order matters only in that each route's helpers precede its kernel;
+        # every route is self-contained apart from the shared helpers above.
+        cuda_src = (skinny + rs_defs + _tma_srcs(sm90) + MAP_SRC + _gemm_src(sm90)
+                    + _wide_src(sm90) + _sk2_src(sm90) + _gq_src(sm90) + _gqx_src(sm90)
+                    + RGEMV_SRC + _rk_src(sm90))
         _ext = load_inline(
             name=f"okc_bf16proj_v141_{arch}" + (f"_dly{_SK2_DELAY}" if _SK2_DELAY else ""),
             cpp_sources="#include <torch/extension.h>\n" + CPP_SRC,
@@ -3161,17 +3213,15 @@ def _build_cutlass():
     """Build the CUTLASS extension (sm_90 only); on any failure record it and leave the route out."""
     global _cut_ext, _cut_err
     try:
-        import importlib.util as _ilu
-        import os as _os
         major, minor = torch.cuda.get_device_capability()
         if major < 9:
             raise RuntimeError("needs sm_90")
-        fi = _ilu.find_spec("flashinfer")
-        if fi is None or not fi.submodule_search_locations:
+        spec = importlib.util.find_spec("flashinfer")
+        if spec is None or not spec.submodule_search_locations:
             raise RuntimeError("flashinfer (CUTLASS headers) not installed")
-        root = _os.path.join(list(fi.submodule_search_locations)[0], "data", "cutlass")
-        inc = [_os.path.join(root, "include"), _os.path.join(root, "tools", "util", "include")]
-        if not all(_os.path.isdir(d) for d in inc):
+        root = os.path.join(list(spec.submodule_search_locations)[0], "data", "cutlass")
+        inc = [os.path.join(root, "include"), os.path.join(root, "tools", "util", "include")]
+        if not all(os.path.isdir(d) for d in inc):
             raise RuntimeError("CUTLASS headers missing under " + root)
         _cut_ext = load_inline(
             name=f"okc_bf16proj_v141_cutlass_{major}{minor}a",
@@ -3182,6 +3232,33 @@ def _build_cutlass():
             verbose=False)
     except Exception as e:   # noqa: BLE001 - any failure only drops this optional route
         _cut_ext, _cut_err = None, f"{type(e).__name__}: {str(e)[:200]}"
+
+
+# ---------------------------------------------------------------------------
+# Weight preparation (host side, runs in prepare()): fragment orders and the
+# lossless 12-bit packing. The packing helpers share _exponent_window /
+# _escapes; the per-kernel stream/table builders stay separate because their
+# layouts and orderings differ (per-CTA streams vs k-ordered escape tables).
+# ---------------------------------------------------------------------------
+def _exponent_window(e71):
+    """Best EXPONENT_WINDOW-wide window of BF16 exponent bits 7..1 for a matrix.
+
+    Returns (base, offset): ``base`` is the window's lowest exponent, and
+    ``offset`` is each weight's exponent clamped into [0, EXPONENT_WINDOW).
+    The window is chosen to cover the most weights, so the fewest weights
+    need exact correction as escapes.
+    """
+    hist = torch.bincount(e71.flatten(), minlength=EXPONENT_VALUES)
+    win = torch.stack(
+        [hist[b:b + EXPONENT_WINDOW].sum() for b in range(EXPONENT_VALUES - EXPONENT_WINDOW + 1)]
+    )
+    base = int(win.argmax())
+    return base, (e71 - base).clamp(0, EXPONENT_WINDOW - 1)
+
+
+def _escapes(e71, base):
+    """Weights whose exponent falls outside [base, base + EXPONENT_WINDOW)."""
+    return (e71 < base) | (e71 > base + EXPONENT_WINDOW - 1)
 
 
 def pack_fragments(w: torch.Tensor) -> torch.Tensor:
@@ -3200,16 +3277,13 @@ def pack_compressed(w: torch.Tensor):
     bits = w.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
     hi = bits >> 8                  # sign | exponent bits 7..1
     e71 = hi & 0x7F
-    hist = torch.bincount(e71.flatten(), minlength=128)
-    win = torch.stack([hist[b:b + 8].sum() for b in range(121)])
-    base = int(win.argmax())
-    o = (e71 - base).clamp(0, 7)
+    base, o = _exponent_window(e71)
     code = ((hi >> 7) << 3) | o
     dec_hi = ((hi >> 7) << 7) | (base + o)
     dec = ((dec_hi << 8) | (bits & 0xFF)).to(torch.int16).view(torch.bfloat16)
-    esc = (e71 < base) | (e71 > base + 7)
+    esc = _escapes(e71, base)
     n_esc = int(esc.sum())
-    if n_esc > n * k // 200:
+    if n_esc > n * k // MAX_ESCAPE_DENOMINATOR:
         return None
     rows, cols = esc.nonzero(as_tuple=True)
     wtrue = w[rows, cols].float()
@@ -3236,7 +3310,7 @@ def pack_compressed(w: torch.Tensor):
     poff[1:] = torch.cumsum(torch.bincount(rg_idx, minlength=nrg), 0).to(torch.int32)
     return {
         "packed": packed,
-        "base4": base * 0x01010101,
+        "base4": base * BASE4_REPLICATE,
         "poff": poff,
         "pk": cols.to(torch.int32).contiguous(),
         "pr": (rows % 16).to(torch.int32).contiguous(),
@@ -3326,7 +3400,7 @@ SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC, CL
     ('pooler8h_r72', 'pooler', 4096, 16, 1, 2, 2, 4, 1, 1),
     ('qkv32_r208', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 1, 1),
     ('router', 'router', 256, 8, 1, 1, 8, 1, 4, 3),
-    ('slice8_r192', 'unpooler', 1024, 8, 1, 1, 8, 2, 2, 1),
+    ('slice8_r192', 'unpooler', UNPOOLER_SLICE_ROWS, 8, 1, 1, 8, 2, 2, 1),
     ('unpooler32_r144', 'unpooler', 8192, 64, 4, 2, 2, 2, 1, 1),
     # okc_tune (14173ac4) retimed winners, Oct 25 12:30 (search-harness ratios vs production in brackets); pair.py both
     # orders: pooler16 -0.43, unpooler16 -0.60, o16 -0.15, qkv8 -0.12, qkv16 -0.08 us (pooler32 r160 / o32 r88: no gain)
@@ -3353,7 +3427,6 @@ SK2_PICK = {  # (layer, tokr) -> config name
     ('unpooler', 16): 'unpooler16t_r72',
     ('unpooler', 32): 'unpooler32_r144',
 }
-SK2_ROT = False
 SK2_K = {"pooler": 8192, "unpooler": 4096, "o": 1024, "qkv_gate": 8192, "router": 8192}
 USE_SK2 = True
 WIDE_BF16 = False  # the wide (RS-wgmma) kernel never beats cuBLAS for BF16 m 33..256
@@ -3384,12 +3457,12 @@ def _sk2_geom(cfg, tokr):
     # everything but the ring: alignment pad, barriers, corrections, peer sums, escape table (<= 64 entries), zero row
     extra = (1024 + 16 * 16 + 32 + nesc * ((toks * cp + 3) // 4 * 4) * 4 + ((CL - 1) * WSK * toks * rp * 4 if CL > 1 else 0)
              + 64 * 8 + 128)
-    cap = 200
+    cap_kb = SK2_DEFAULT_RING_CAP_KB
     tail = name.rsplit("_r", 1)
     if len(tail) == 2 and tail[1].isdigit():
-        cap = int(tail[1])
-    ring = min(cap * 1024, 232448 - extra)
-    nstage = max(2, min(16, nst, ring // sst))
+        cap_kb = int(tail[1])
+    ring = min(cap_kb * 1024, SK2_RING_SMEM_BUDGET_BYTES - extra)
+    nstage = max(SK2_MIN_STAGES, min(SK2_MAX_STAGES, nst, ring // sst))
     return hl, nstage
 
 
@@ -3429,13 +3502,10 @@ def sk2_compress(w):
     low = bits & 0xFF
     e71 = hi & 0x7F
     sign = hi >> 7
-    hist = torch.bincount(e71.flatten(), minlength=128)
-    win = torch.stack([hist[b:b + 8].sum() for b in range(121)])
-    base = int(win.argmax())
-    o = (e71 - base).clamp(0, 7)
+    base, o = _exponent_window(e71)
     code = (sign << 3) | o
-    esc = (e71 < base) | (e71 > base + 7)
-    if int(esc.sum()) > n * k // 200:
+    esc = _escapes(e71, base)
+    if int(esc.sum()) > n * k // MAX_ESCAPE_DENOMINATOR:
         return None
     T, U = n // 8, k // 64
     c8 = code.to(torch.uint8)
@@ -3454,7 +3524,7 @@ def sk2_compress(w):
     rows = idx[:, 0] * 8 + (lane >> 2)
     cols = idx[:, 1] * 64 + 16 * (v >> 2) + 8 * ((v >> 1) & 1) + 2 * (lane & 3) + (v & 1)
     wbits = (tu[esc].contiguous().view(torch.int16).to(torch.int32) & 0xFFFF).contiguous()   # the original BF16 weights
-    return {"packed": packed, "base4": base * 0x01010101, "rows": rows, "cols": cols, "wbits": wbits}
+    return {"packed": packed, "base4": base * BASE4_REPLICATE, "rows": rows, "cols": cols, "wbits": wbits}
 
 
 CG_CONFIGS = {"qkv_gate": (2, 256), "o": (2, 64), "unpooler": (2, 128), "pooler": (2, 512)}   # layer -> (rows per CTA, threads); m = 1
@@ -3467,13 +3537,10 @@ def cg_compress(w, rows_per_cta):
     bits = w.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
     hi, low = bits >> 8, bits & 0xFF
     e71, sign = hi & 0x7F, hi >> 7
-    hist = torch.bincount(e71.flatten(), minlength=128)
-    win = torch.stack([hist[b:b + 8].sum() for b in range(121)])
-    base = int(win.argmax())
-    o = (e71 - base).clamp(0, 7)
+    base, o = _exponent_window(e71)
     code = ((sign << 3) | o).to(torch.uint8)
-    esc = (e71 < base) | (e71 > base + 7)
-    if int(esc.sum()) > n * k // 200:
+    esc = _escapes(e71, base)
+    if int(esc.sum()) > n * k // MAX_ESCAPE_DENOMINATOR:
         return None
     g = code.view(n, k // 8, 8)
     C = (g[:, :, 0:4] | (g[:, :, 4:8] << 4)).reshape(n, k // 2).contiguous()
@@ -3494,7 +3561,7 @@ def cg_compress(w, rows_per_cta):
     tab[:, 0, 0] = counts.to(torch.int32)
     tab[cta, pos, 0] = (((rows - cta * rows_per_cta) << 16) | cols).to(torch.int32)
     tab[cta, pos, 1] = bits[rows, cols].to(torch.int32)   # the original BF16 weights; the kernel forms the correction
-    return {"L": L, "C": C, "tab": tab.contiguous(), "pmax": pmax, "base4": base * 0x01010101}
+    return {"L": L, "C": C, "tab": tab.contiguous(), "pmax": pmax, "base4": base * BASE4_REPLICATE}
 
 
 def sk2_stream(tub, n_cfg, R, NT, NWR, WSK, UPW):
@@ -3523,10 +3590,8 @@ def sk2_balance_perm(w, n_rows, R):
     wl = w[:n_rows]
     bits = wl.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
     e71 = (bits >> 8) & 0x7F
-    hist = torch.bincount(e71.flatten(), minlength=128)
-    win = torch.stack([hist[b:b + 8].sum() for b in range(121)])
-    base = int(win.argmax())
-    cnt = ((e71 < base) | (e71 > base + 7)).sum(1)
+    base, _ = _exponent_window(e71)
+    cnt = _escapes(e71, base).sum(1)
     # 4-row groups are dealt (keeps 4-column output groups contiguous: vector stores in the epilogue)
     G4 = 4
     tcnt = cnt.view(n_rows // G4, G4).sum(1)
@@ -3637,9 +3702,26 @@ def _mt_key(m):
     return 0 if m == 1 else 1 if m <= 8 else 2 if m <= 16 else 4 if m <= 32 else 8
 
 
+# ---------------------------------------------------------------------------
+# prepare(): build every weight layout once into `state`. The CUTLASS
+# extension builds on a background thread while the weights are compressed.
+# ---------------------------------------------------------------------------
+def _ensure_skinny_stream(state, name, src, comp, c, kk, n, dev, splits, rgc, wsn, ks, n_cfg):
+    """Ensure one skinny decomposition's prepared inputs exist in ``state``:
+    the per-CTA weight stream, its split-K counter, and (compressed only) its
+    per-CTA escape table. Idempotent: shared decompositions are built once."""
+    key = (name, 0 if wsn == 1 else splits, rgc, wsn, ks, n_cfg)
+    if key not in state["streams"]:
+        state["streams"][key] = build_stream(src, comp, n_cfg, kk, splits, rgc, wsn, ks)
+    ckey = (name, splits, rgc, wsn, ks, n_cfg)
+    if ckey not in state["cnt"]:
+        state["cnt"][ckey] = torch.zeros(n // 16, dtype=torch.int32, device=dev)  # per-config counters
+    if comp and (name, splits, rgc, n_cfg) not in state["tabs"]:
+        state["tabs"][(name, splits, rgc, n_cfg)] = build_patch_table(c, n_cfg, kk, splits, rgc)
+
+
 def prepare(weights):
-    import threading
-    ext = _get_ext()
+    _get_ext()  # compile now, so a build failure surfaces in prepare(), not mid-run
     # the CUTLASS extension builds in the background (nvcc is a subprocess) while the weights are compressed; started
     # after the main build so the two load_inline calls never overlap
     cut_thread = None
@@ -3656,15 +3738,15 @@ def prepare(weights):
     ws_floats = 0
     for (lname, mtk), (splits, rgc, wsn, ks) in TMA_CONFIGS.items():
         mmax = {0: 1, 1: 8, 2: 16, 4: 32, 8: 64}[mtk]
-        ws_floats = max(ws_floats, splits * mmax * w_rows[lname])
+        ws_floats = max(ws_floats, splits * mmax * WEIGHT_ROWS[lname])
     for (lname, mm), (splits, rgc, wsn, ks) in TMA_ALT.items():
-        ws_floats = max(ws_floats, splits * mm * w_rows[lname])
+        ws_floats = max(ws_floats, splits * mm * WEIGHT_ROWS[lname])
     state["ws_shared"] = torch.empty(ws_floats, dtype=torch.float32, device=dev)
     gemm_floats = 0
     for (lname, bn), (nwg, splits, stages) in GEMM_CONFIGS.items():
-        gemm_floats = max(gemm_floats, (w_rows[lname] // (64 * nwg)) * splits * (nwg * 128) * (bn // 2))
+        gemm_floats = max(gemm_floats, (WEIGHT_ROWS[lname] // (64 * nwg)) * splits * (nwg * 128) * (bn // 2))
     for (lname, tok, nz), (nwg, splits, stages) in WIDE_CONFIGS.items():
-        gemm_floats = max(gemm_floats, nz * (w_rows[lname] // (64 * nwg)) * splits * (nwg * 64) * tok)
+        gemm_floats = max(gemm_floats, nz * (WEIGHT_ROWS[lname] // (64 * nwg)) * splits * (nwg * 64) * tok)
     state["mid_ws_shared"] = torch.empty(gemm_floats, dtype=torch.float32, device=dev)
     if GEMM_DIAG:
         state["ws_shared_diag"] = torch.empty(4 * 1024 * 1024, dtype=torch.float32, device=dev)
@@ -3697,13 +3779,13 @@ def prepare(weights):
             w = w.contiguous()
             state["raw"][name] = w
             if name in CG_CONFIGS:
-                wc = w[:1024] if name == "unpooler" else w   # the unpooler at m = 1 is the 1024-row slice
+                wc = w[:UNPOOLER_SLICE_ROWS] if name == "unpooler" else w   # the unpooler at m = 1 is the slice
                 cg = cg_compress(wc.contiguous(), CG_CONFIGS[name][0])
                 if cg is not None:
                     state.setdefault("cg", {})[name] = cg
             if name in TORCHT_LAYERS and sm90_:
                 state.setdefault("rawT", {})[name] = w.t().contiguous()
-            c = pack_compressed(w) if name in COMPRESS else None
+            c = pack_compressed(w) if name in COMPRESSED_LAYERS else None
             if c is not None:
                 src, comp = c["packed"].transpose(0, 1).contiguous(), True  # [rg, u, 3, 32, 16]
                 state["base4"][name] = c["base4"]
@@ -3716,28 +3798,14 @@ def prepare(weights):
         for (lname, mtk), (splits, rgc, wsn, ks) in TMA_CONFIGS.items():
             if lname != name or not old_paths:
                 continue
-            n_cfg = 1024 if (name == "unpooler" and mtk <= 1) else n
-            key = (name, 0 if wsn == 1 else splits, rgc, wsn, ks, n_cfg)
-            if key not in state["streams"]:
-                state["streams"][key] = build_stream(src, comp, n_cfg, kk, splits, rgc, wsn, ks)
-            ckey = (name, splits, rgc, wsn, ks, n_cfg)
-            if ckey not in state["cnt"]:
-                state["cnt"][ckey] = torch.zeros(n // 16, dtype=torch.int32, device=dev)  # per-config counters
-            if comp and (name, splits, rgc, n_cfg) not in state["tabs"]:
-                state["tabs"][(name, splits, rgc, n_cfg)] = build_patch_table(c, n_cfg, kk, splits, rgc)
+            n_cfg = UNPOOLER_SLICE_ROWS if (name == "unpooler" and mtk <= 1) else n
+            _ensure_skinny_stream(state, name, src, comp, c, kk, n, dev, splits, rgc, wsn, ks, n_cfg)
         if comp and old_paths:
             for (lname, mm), (splits, rgc, wsn, ks) in TMA_ALT.items():
                 if lname != name:
                     continue
-                n_cfg = 1024 if (name == "unpooler" and mm <= 8) else n
-                key = (name, 0 if wsn == 1 else splits, rgc, wsn, ks, n_cfg)
-                if key not in state["streams"]:
-                    state["streams"][key] = build_stream(src, comp, n_cfg, kk, splits, rgc, wsn, ks)
-                ckey = (name, splits, rgc, wsn, ks, n_cfg)
-                if ckey not in state["cnt"]:
-                    state["cnt"][ckey] = torch.zeros(n // 16, dtype=torch.int32, device=dev)
-                if (name, splits, rgc, n_cfg) not in state["tabs"]:
-                    state["tabs"][(name, splits, rgc, n_cfg)] = build_patch_table(c, n_cfg, kk, splits, rgc)
+                n_cfg = UNPOOLER_SLICE_ROWS if (name == "unpooler" and mm <= 8) else n
+                _ensure_skinny_stream(state, name, src, comp, c, kk, n, dev, splits, rgc, wsn, ks, n_cfg)
         for (lname, tok, nz), (nwg, splits, stages) in WIDE_CONFIGS.items():
             if lname != name or not comp or not (old_paths or WIDE_BF16):   # unused on sm_90 (cuBLAS / gq / gqx)
                 continue
@@ -3760,13 +3828,14 @@ def prepare(weights):
             state["wtile"][layer] = swizzle_tiles(state["raw"][layer], 128)
             for a_s in (0, 1):
                 for sp_ in sorted({GEMM_CONFIGS[(layer, 128)][1], GEMM_CONFIGS[(layer, 256)][1], 1}):
-                    state["diag_cnt"][(layer, a_s, sp_)] = torch.zeros(w_rows[layer] // 16, dtype=torch.int32, device=dev)
+                    state["diag_cnt"][(layer, a_s, sp_)] = torch.zeros(WEIGHT_ROWS[layer] // 16, dtype=torch.int32, device=dev)
     if cut_thread is not None:
         cut_thread.join(timeout=CUTLASS_BUILD_TIMEOUT)   # ~70-80 s on an H200 pod; never let it threaten prepare's limit
         if cut_thread.is_alive():
             print(f"[okc] CUTLASS route off: build still running after {CUTLASS_BUILD_TIMEOUT} s", file=sys.stderr)
     if _cut_ext is not None and (cut_thread is None or not cut_thread.is_alive()):
-        state["cut_ws"] = torch.zeros(1 << 20, dtype=torch.uint8, device=dev)   # persistent scheduler: a few KB at most
+        # Persistent scheduler workspace: a few KB at most, sized with headroom.
+        state["cut_ws"] = torch.zeros(1 << 20, dtype=torch.uint8, device=dev)
         state["cut_layers"] = set(CUTLASS_LAYERS) & set(state["raw"])
     elif _cut_err is not None:
         print(f"[okc] CUTLASS route off: {_cut_err}", file=sys.stderr)
@@ -3776,6 +3845,12 @@ def prepare(weights):
     return state
 
 
+# ---------------------------------------------------------------------------
+# Routing, selftest, autotune. The static route maps (layer, m) to a family;
+# _candidates adds the autotuner alternatives; _autotune times them as CUDA
+# graph replays from a cold L2 and keeps the fastest per (layer, m) in
+# state["choice"]. An untuned m in _nearby_choice takes its bucket's choice.
+# ---------------------------------------------------------------------------
 # Which implementation runs a (layer, m): "skinny" (TMA-streamed tensor-core GEMV, m <= 32),
 # "gemm" (TMA + wgmma split-K GEMM, sm_90, m <= 256) or "torch" (cuBLAS, as SGLang).
 ROUTE_BF16 = [(32, "skinny"), (256, "wide")]
@@ -3817,11 +3892,11 @@ def _selftest(weights, state):
     does not match.  Guards against a kernel that misbehaves on a GPU this file was not tested on."""
     state["disabled"] = set()
     g = torch.Generator(device=weights["o"].device)
-    g.manual_seed(1234)
+    g.manual_seed(SELFTEST_SEED)
     for layer, w in weights.items():
         n, k = w.shape
         for m in SELFTEST_M:
-            nn = 1024 if (layer == "unpooler" and m <= 8) else n
+            nn = UNPOOLER_SLICE_ROWS if (layer == "unpooler" and m <= 8) else n
             x = torch.randn(m, k, device=w.device, generator=g).to(torch.bfloat16)
             ref = x.double() @ w[:nn].double().T
             if layer != "router":
@@ -3844,6 +3919,10 @@ def _selftest(weights, state):
                     print(f"[okc] selftest {layer} m={m} {ch[0]}: rel err {err:.3e} -> disabled", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Running one projection: each _run_* allocates a fresh output and launches
+# one route. Nothing is cached across calls.
+# ---------------------------------------------------------------------------
 def _run_skinny(x, layer, m, n, k, state, cfg, tu_key, dg=0):
     splits, rg, wsn, ks = cfg
     mtk = _mt_key(m)
@@ -3854,10 +3933,12 @@ def _run_skinny(x, layer, m, n, k, state, cfg, tu_key, dg=0):
     if state["comp"][layer]:
         tab, pmax = state["tabs"][(layer, splits, rg, n)]
         fn(stream, x, out, state["ws_shared"], cnt, tab, pmax, state["base4"][layer], m, n, k, k, splits,
-           max(mtk, 1), rg, wsn, 1, w_rows[layer] // 16, ks, dg)
+           max(mtk, 1), rg, wsn, 1, WEIGHT_ROWS[layer] // 16, ks, dg)
     else:
+        # Uncompressed: no escapes, so the patch table is the dummy and
+        # pmax/base4 are 0 (the kernel skips exact correction).
         fn(stream, x, out, state["ws_shared"], cnt, state["dummy"], 2, 0, m, n, k, k, splits,
-           max(mtk, 1), rg, wsn, 0, w_rows[layer] // 16, ks, dg)
+           max(mtk, 1), rg, wsn, 0, WEIGHT_ROWS[layer] // 16, ks, dg)
     return out
 
 
@@ -4012,14 +4093,14 @@ def _autotune(weights, state):
     if not AUTOTUNE:
         return
     dev = weights["o"].device
-    flush = torch.ones(64 * 1024 * 1024 // 1024, 1024, dtype=torch.float32, device=dev)   # 256 MB, read-only sweep
-    sink = torch.empty(1024, dtype=torch.float32, device=dev)
+    flush = torch.ones(L2_FLUSH_ROWS, 1024, dtype=torch.float32, device=dev)  # read-only sweep
+    sink = torch.empty(flush.shape[1], dtype=torch.float32, device=dev)
     g = torch.Generator(device=dev)
-    g.manual_seed(4321)
-    reps = 24
+    g.manual_seed(AUTOTUNE_SEED)
+    reps = AUTOTUNE_REPS
     for m in TUNE_M:
         for layer, w in weights.items():
-            n = 1024 if (layer == "unpooler" and m <= 8) else w.shape[0]
+            n = UNPOOLER_SLICE_ROWS if (layer == "unpooler" and m <= 8) else w.shape[0]
             k = w.shape[1]
             cands = _candidates(layer, m, state)
             if len(cands) < 2:
@@ -4093,6 +4174,9 @@ def _nearby_choice(layer, m, state):
     return ch
 
 
+# ---------------------------------------------------------------------------
+# Entry point: the harness calls prepare(weights) once, then kernel_fn per call.
+# ---------------------------------------------------------------------------
 def kernel_fn(data, state):
     x = data["x"]
     cfg = data["config"]

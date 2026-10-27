@@ -1,20 +1,93 @@
 # okc: problem=muse_attention_decode
 """Gated attention decode for Muse Spark Open: one fused CUDA kernel per call.
 
-Each CTA takes one request, one pair of KV heads (its 16 query heads) and one contiguous range of
-cached positions (split-KV). It normalizes the queries (and RoPE on sliding layers), builds the
-block's new keys/values (normalized, RoPE, FP8) and writes them to the cache, streams its range of
-the paged FP8 cache through shared memory (cp.async, 4 stages), computes QK^T with FP8 tensor-core
-MMAs (queries rounded to E4M3, as FA3 does) and PV with FP16 MMAs (P in FP16, V exact in FP16), with
-an online softmax. Splits are merged with FP32 atomics after rescaling to a fixed reference (QK-norm
-bounds the logits); the last CTA of each (request, KV pair) normalizes, applies rmsnorm *
-sigmoid(gate) and writes the output, then zeroes the workspace for the next call.
+Algorithm
+---------
+For each request, the kernel computes gated attention over the request's cached
+keys/values plus the block's own new tokens:
+
+    O = rmsnorm(softmax(Q K^T * sm_scale) V) * sigmoid(gate)
+
+with Q/K first RMS-normalized (Q additionally scaled by qk_scale_factor), RoPE
+applied on sliding-window layers, and K/V quantized to FP8 (E4M3) in the
+cache. QK^T runs on FP8 tensor-core MMAs (queries rounded to E4M3, as FA3
+does) and PV on FP16 MMAs (P in FP16, V exact in FP16) -- except q_len 8 on
+sm_90, where PV is an FP8 wgmma (P in E4M3, as SGLang's FA3 FP8 path) -- with
+an online softmax, so no full score matrix is ever materialized.
+
+Design
+------
+* One CTA per (request, pair of KV heads, split-KV split). A "pair" is two KV
+  heads, i.e. 16 query heads: the kernel's unit of work.
+* Each CTA builds the block's new K/V (normalized, RoPE, FP8) and writes them
+  to the cache, then streams its range of the paged FP8 cache through shared
+  memory in 64-key tiles (cp.async, multi-stage pipeline).
+* Splits are merged with FP32 atomics after rescaling to a fixed reference
+  (QK-norm bounds the logits); the last CTA of each (request, KV pair)
+  normalizes, applies rmsnorm * sigmoid(gate), writes the output, then zeroes
+  the workspace for the next call.
+* Launch shapes: per-request split-KV, per-request clusters (DSMEM
+  reduction), a flat kernel (one CTA pass over all requests' keys, for full
+  layers), and a cooperative finalize (every CTA finalizes a slice) for grids
+  known resident. The host picks one in _plan(); the kernel itself is built
+  once per launch mode (the MODE template parameter), so each build carries
+  only its own epilogue.
+* Tuning switches (the OKC_* table at the top of the CUDA source) are a
+  closed world: the host build passes only -DOKC_SM90; everything else is
+  fixed in this file. _build() rejects -DOKC_* in its extra flags, so a
+  stale override cannot silently diverge from that table.
+* CUDA-graph capturable: no host syncs in the timed path. The module-level
+  caches hold only device properties, derived constants (RoPE frequencies),
+  and scratch buffers (the workspace is zeroed by the kernel itself between
+  calls), never call inputs or results.
+
+Entry point: kernel_fn(data) -> output tensor. Shapes the CUDA path does not
+cover fall back to _fallback(), a plain PyTorch implementation of the same
+math.
+
+CUDA layout: tuning switches, Cfg/Params/Smem (launch config, kernel
+arguments, shared-memory layout), small device helpers (cp.async, mbarrier,
+wgmma, conversions, cluster/DSMEM), the per-segment main loop (segment()),
+the finalizes (sum_copies, fin_nc1, flat_finalize), attn_kernel, then the
+host launchers (launch, run) at the end.
 """
 
-import math
 from typing import TypedDict
 
 import torch
+
+
+# ---- shapes the kernel supports (see _supported) ----
+HEAD_DIM = 64            # head_dim of the supported layout
+Q_HEADS_PER_PAIR = 16    # query heads per KV-head pair (the kernel's unit of work)
+SUPPORTED_Q_LENS = (1, 8)
+MAX_BATCH = 512
+MAX_REQUEST_PAIRS = 4096  # batch * (num_kv_heads // 2)
+
+# ---- indexing ----
+TILE_KEYS = 64            # keys per pipeline tile
+INDEX_LIMIT = 1 << 31    # 32-bit indexing bound checked by _fits
+
+# ---- scratch buffers ----
+WORKSPACE_MIN_ROWS = 1 << 15  # _workspace grows to at least this many rows
+CLUSTER_MIN_FLOATS = 1 << 20  # _cluster_bufs: sm_80 DSMEM-emulation buffer floor
+CLUSTER_MIN_INTS = 1 << 12
+CLUSTER_SLACK = 1024          # per-CTA slack in the cluster float buffer, in floats
+
+LOG2E = 1.4426950408889634  # log2(e), to full double precision
+
+# ---- packed kernel-mode bitfield (the `tma` argument to run) ----
+# bit 0: TMA loads (carried in plan["tma"]); bit 1: cooperative finalize;
+# bits 2..13: w0, the flat first-CTA key share (/1024); bit 16: PDL.
+COOP_BIT = 1   # bit 1: cooperative finalize
+W0_SHIFT = 2   # bits 2..13: w0, the flat first-CTA key share (/1024)
+W0_MAX = 4095  # 12-bit field
+PDL_BIT = 16   # bit 16: programmatic dependent launch
+
+# ---- per-(request, KV pair) launch grid: the per-request grids run slightly
+# below the CTA target, leaving headroom for the finalize tail ----
+PLAN_HEADROOM_NUM = 21
+PLAN_HEADROOM_DEN = 22
 
 
 class Config(TypedDict):
@@ -32,6 +105,9 @@ class Config(TypedDict):
 
 
 class Inputs(TypedDict):
+    # scheduler_metadata, cache_seqlens and cu_seqlens_q are carried for the
+    # harness interface; the CUDA path uses seq_lens / cache_loc / page_table
+    # instead, and positions feeds only the fallback.
     qkv: torch.Tensor
     positions: torch.Tensor
     cache_loc: torch.Tensor
@@ -59,455 +135,135 @@ CUDA_SRC = r"""
 
 namespace {
 
+// ---- tuning switches (closed world) ----
+// Every switch below is fixed in this file: the host build passes only
+// -DOKC_SM90. 0/1 = off/on; a value with OFF: is a disabled variant kept as a
+// named switch so the alternative stays discoverable. Values were tuned on H200.
 #ifndef OKC_SM90
-#define OKC_SM90 0
+#define OKC_SM90 0   // set by the host build (-DOKC_SM90=1 on sm_90+); default 0
 #endif
-#ifndef OKC_NP
-#define OKC_NP 128      // producer threads (q_len 1 flat; 128 since v111: f16 -0.7%, f32 -0.4% vs 256)
-#endif
-#ifndef OKC_WS
-#define OKC_WS 1        // producer warpgroup for the flat (B > 1, full layer) kernel; 0 = v10's flat kernel
-#endif
-#ifndef OKC_WS8
-#define OKC_WS8 1       // producer warps for the q_len 8 flat kernel too
-#endif
-#ifndef OKC_NP8
-#define OKC_NP8 128     // q_len 8: 4 producer warps (its consumers need the registers)
-#endif
-#ifndef OKC_WSMINB
-#define OKC_WSMINB 2
-#endif
-#ifndef OKC_SETMAXNREG
-#define OKC_SETMAXNREG 1
-#endif
-#ifndef OKC_NOCOMPUTE
-#define OKC_NOCOMPUTE 0
-#endif
-#ifndef OKC_PREGS
-#define OKC_PREGS 0
-#endif
-#ifndef OKC_TMAPG
-#define OKC_TMAPG 1     // producer mode: page indices by TMA (one copy per tile) instead of per-thread loads
-#endif
-#ifndef OKC_XHALFPV
-#define OKC_XHALFPV 0   // (probe) q_len 1: half the PV work, to see whether the q1 flat loop is consumer-bound
-#endif
-#ifndef OKC_XNOWAIT
-#define OKC_XNOWAIT 0   // (probe) per-request loop: no wait for the tile's copies (garbage), the compute-bound tile time
-#endif
-#ifndef OKC_FENCEAR
+#define OKC_NP 128      // producer threads for the q_len-1 flat kernel
+#define OKC_WS 1        // flat full-layer kernel: a producer warpgroup issues the K/V copies (warp specialization)
+#define OKC_WS8 1       // same warp specialization for the q_len-8 flat kernel
+#define OKC_NP8 128     // producer threads for the q_len-8 flat kernel (4 warps; consumers need the registers)
+#define OKC_WSMINB 2    // CTAs-per-SM floor for warp-specialized launches
+#define OKC_SETMAXNREG 1  // split registers with setmaxnreg: producers get PREGS, consumers CREGS
+#define OKC_PREGS 0     // producer register-count override (0: 56 for q_len 1 with <= 128 producers, else 32)
+#define OKC_TMAPG 1     // producer mode: page indices by TMA, one copy per tile, instead of per-thread loads
+#define OKC_XHALFPV 0   // OFF: timing probe only (wrong results) -- half the PV work for q_len 1
+#define OKC_XNOWAIT 0   // OFF: timing probe only (wrong results) -- skip the tile-copy wait
 #define OKC_FENCEAR 0   // merge / barrier fences as fence.acq_rel.gpu instead of fence.sc.gpu
-#endif
-#ifndef OKC_MRGDBG
-#define OKC_MRGDBG 0    // (debug builds) phase marks around the merge's fence (columns precl1 / cl2)
-#endif
-#ifndef OKC_MERGE2
+#define OKC_MRGDBG 0    // debug: phase marks around the merge's fence
 #define OKC_MERGE2 1    // last-CTA merges: one acq_rel atomic after the CTA barrier instead of per-thread fences
-#endif
-#ifndef OKC_MERGE3
 #define OKC_MERGE3 1    // cooperative merges: one acq_rel barrier arrive after the CTA barrier instead of per-thread fences
-#endif
-#ifndef OKC_IDXFIRST
-#define OKC_IDXFIRST 1  // per-request kernels: K/V issued once the page indices land (not after the q rows too)
-#endif
-#ifndef OKC_ONETILE
-#define OKC_ONETILE 1   // per-request ONE builds: single fully cached tile -> straight-line prologue copies
-#endif
-#ifndef OKC_MAGICDIV
-#define OKC_MAGICDIV 1  // per-request chunk: host magic multiplier instead of fdiv_i
-#endif
-#ifndef OKC_SC1
+#define OKC_IDXFIRST 1  // per-request kernels: issue K/V once the page indices land, not after the q rows too
+#define OKC_ONETILE 1   // per-request ONE builds: a single fully cached tile -> straight-line prologue copies
+#define OKC_MAGICDIV 1  // per-request chunks: host magic multiplier instead of fdiv_i
 #define OKC_SC1 1       // coop finalize: sum_copies without the copy loop when nc == 1
-#endif
-#ifndef OKC_ONE
 #define OKC_ONE 1       // per-request: builds for single-tile splits (MODE | 4), chosen by the host
-#endif
-#ifndef OKC_QDIRECT
 #define OKC_QDIRECT 1   // per-request q8: the q pass writes the e4m3 wgmma A tile directly
-#endif
-#ifndef OKC_SPEC
 #define OKC_SPEC 1      // one request, page size 1: speculate seq_len = page-table width - q_len (verified on device)
-#endif
-#ifndef OKC_PDLLATE
-#define OKC_PDLLATE 0   // PDL builds (decode_layer): skip the early launch_dependents trigger at the tile-loop end
-#endif
-#ifndef OKC_QP16
-#define OKC_QP16 1      // q_len 8 QDIRECT q pass: four threads per row (16 dims each)
-#endif
-#ifndef OKC_ONENEW
-#define OKC_ONENEW 1    // ONE builds: the straight-line prologue copies also for the tile holding new rows
-#endif
-#ifndef OKC_SC8
+#define OKC_PDLLATE 0   // PDL builds: skip the early launch_dependents trigger at the tile-loop end
+#define OKC_QP16 1      // q_len-8 QDIRECT q pass: four threads per row (16 dims each)
+#define OKC_ONENEW 1    // ONE builds: straight-line prologue copies also for the tile holding new rows
 #define OKC_SC8 1       // coop finalize: the eight workspace copies' loads in one round trip
-#endif
-#ifndef OKC_PINDIV
 #define OKC_PINDIV 1    // coop finalize: the slice divisions pinned above the barrier wait
-#endif
-#ifndef OKC_ONEPRED
 #define OKC_ONEPRED 1   // ONE builds: predicated (branch-free) straight-line prologue copies
-#endif
-#ifndef OKC_LATETID
 #define OKC_LATETID 1   // per-request prologue: tid re-read (volatile) after the page-index copies, so the q-pass math stays late
-#endif
-#ifndef OKC_PFASTPR
 #define OKC_PFASTPR 1   // per-request issue_kv: branch-free shift-add addressing on fully cached tiles (page size 1)
-#endif
-#ifndef OKC_PFAST
-#define OKC_PFAST 1     // flat producer: branch-free shift-add addressing on common tiles (page size 1, < 4 GB)
-#endif
-#ifndef OKC_PGCONT
-#define OKC_PGCONT 0    // (racecheck control) page-index TMA barriers once per launch, slots continued across segments
-#endif
-#ifndef OKC_TMAPG8
-#define OKC_TMAPG8 0    // ... for the q_len 8 flat kernel too (measured ~+0.7%)
-#endif
-#ifndef OKC_ST8F
-#define OKC_ST8F 4      // pipeline stages of the q_len 8 flat kernel
-#endif
-#ifndef OKC_COOP
+#define OKC_PGCONT 0    // OFF: page-index TMA barriers once per launch, slots continued across segments (racecheck control)
+#define OKC_TMAPG8 0    // OFF: TMA page indices for the q_len-8 flat kernel too
+#define OKC_ST8F 4      // pipeline stages of the q_len-8 flat kernel
 #define OKC_COOP 1      // cooperative finalize for single-request grids (0: always the last-CTA finalize)
-#endif
-#ifndef OKC_PVW
-#define OKC_PVW 0       // q_len 8 on sm_90: PV as an asynchronous wgmma from a double-buffered f16 V tile
-#endif
-#ifndef OKC_WGDEC
-#define OKC_WGDEC 1     // q_len 8 producer mode: the two consumer warpgroups sync separately (one per head)
-#endif
-#ifndef OKC_SEGDBG
-#define OKC_SEGDBG 0
-#endif
-#define DBGSTRIDE (OKC_SEGDBG ? 64 : 16)
-#ifndef OKC_EXH2
-#define OKC_EXH2 0      // q_len 8 on sm_90: softmax exponentials as packed f16 pairs (half the MUFU ops)
-#endif
-#ifndef OKC_PV8
-#define OKC_PV8 1       // q_len 8 on sm_90: PV as an FP8 wgmma (P in e4m3, as SGLang's FA3 FP8 path does: pod/p16probe*.py)
-#endif
-#ifndef OKC_PROF
-#define OKC_PROF 0      // per-warp phase profile of the main loops (diagnostic builds)
-#endif
-#ifndef OKC_PROFPV8
+#define OKC_PVW 0       // OFF: q_len-8 PV as an asynchronous wgmma from a double-buffered f16 V tile
+#define OKC_WGDEC 1     // q_len-8 producer mode: the two consumer warpgroups sync separately (one per head)
+#define OKC_SEGDBG 0    // debug: wider dbg stride (64) + segment-lead stamps
+#define DBGSTRIDE (OKC_SEGDBG ? 64 : 16)   // dbg slots per CTA: 64 with segment stamps, else 16
+#define OKC_PV8 1       // q_len-8 PV as an FP8 wgmma (P in e4m3, as FA3's FP8 path)
+#define OKC_PROF 0      // debug: per-warp phase profile of the main loops
 #define OKC_PROFPV8 0   // profile builds: keep the FP8 PV path
-#endif
-#define PV8ON (OKC_PV8 && (!OKC_PROF || OKC_PROFPV8) && !OKC_PVW)
-#ifndef OKC_PV8FLAT
-#define OKC_PV8FLAT 1   // FP8 PV in the flat (B > 1 full) kernel too (needs OKC_QSS: 104-register consumers)
-#endif
-#ifndef OKC_QSS
+#define PV8ON (OKC_PV8 && (!OKC_PROF || OKC_PROFPV8) && !OKC_PVW)   // FP8 PV actually on (profiling turns it off unless PROFPV8)
+#define OKC_PV8FLAT 1   // FP8 PV in the flat (B > 1 full) kernel too
 #define OKC_QSS 1       // with FP8 PV: q in shared memory (QK^T as an SS wgmma), 8 fewer live registers
-#endif
-#ifndef OKC_PV8SYNC
-#define OKC_PV8SYNC 0   // wait for each PV wgmma inside its tile (fewer live registers)
-#endif
-#ifndef OKC_Q8RAW
-#define OKC_Q8RAW 1     // q_len 8 sm_90: FP8 query from the unit-RMS query (scores scaled after QK^T)
-#endif
-#ifndef OKC_PROBE_O8
-#define OKC_PROBE_O8 0
-#endif
-#ifndef OKC_P8EMU
-#define OKC_P8EMU 0
-#endif
-#ifndef OKC_FLATCOOP1C
-#define OKC_FLATCOOP1C 0  // compile the grid-wide flat finalize for q_len 1 too
-#endif
-#ifndef OKC_RAWTHR
-#define OKC_RAWTHR 0    // q8 lazy max: compare raw scores with (offset + 8) / ssc (measured slower: +10 static fp32 instr)
-#endif
-#ifndef OKC_PCHK
+#define OKC_PV8SYNC 0   // OFF: wait for each PV wgmma inside its tile (fewer live registers)
+#define OKC_Q8RAW 1     // q_len-8: FP8 query from the unit-RMS query (scores scaled after QK^T)
+#define OKC_FLATCOOP1C 0  // OFF: compile the grid-wide flat finalize for q_len 1 too
+#define OKC_RAWTHR 0    // OFF: q8 lazy max compares raw scores with (offset + 8) / ssc
 #define OKC_PCHK 1      // q8: the lazy-max offset test on the packed e4m3 P (no per-tile row-max scan)
-#endif
-#ifndef OKC_TURN
-#define OKC_TURN 0      // q8 flat: the heads' warpgroups alternate in the exponential phase (1: every tile, measured
-                        // +1.3%; 2: offset once, on the first tile)
-#endif
-#ifndef OKC_CLSM
-#define OKC_CLSM 0      // (experiment) minimum dynamic shared memory of cluster launches (forces one CTA per SM)
-#endif
-#ifndef OKC_PDLKV
+#define OKC_TURN 0      // OFF: q8 flat -- the heads' warpgroups alternate in the exponential phase (1: every tile, 2: offset once, on the first tile)
+#define OKC_CLSM 0      // OFF: experiment -- minimum dynamic shared memory of cluster launches (forces one CTA per SM)
 #define OKC_PDLKV 0     // PDL launches: K/V issued before griddepcontrol.wait, q / new k,v as direct loads after it
-                        // (decode_layer: build with 1; standalone it costs ~0.3% from code layout)
-#endif
-#ifndef OKC_BRFREE
-#define OKC_BRFREE 0    // per-request K/V and page-index issue without per-row branches (predicated, zero-fill; neutral)
-#endif
-#ifndef OKC_RARE
 #define OKC_RARE 1      // q8 flat: common tiles (no mask, no new rows) found once; one compare per tile
-#endif
-#ifndef OKC_PREUNR
-#define OKC_PREUNR 1    // per-request prologue: the first STAGES-1 tiles' K/V issue unrolled (no loop branches; s1 -2%)
-#endif
-#ifndef OKC_FIN1
-#define OKC_FIN1 0      // (experiment) coop finalize row loop kept rolled
-#endif
-#ifndef OKC_PCHKTEST
-#define OKC_PCHKTEST 0  // test hook for OKC_PCHK (offset moves on most tiles)
-#endif
-#ifndef OKC_UNEV
-#define OKC_UNEV 0      // per-request coop grids with more splits than SMs: uneven tiles by dispatch wave (w0; no gain
-                        // on b1 q8 full: whole-tile granularity, 5 tiles per split, cannot shorten the slow wave)
-#endif
-#ifndef OKC_W0L1
-#define OKC_W0L1 0      // per-SM uneven shares for the non-cooperative (q_len 1) flat grids too (measured +3..5 us: the
-                        // generation-tagged registration costs more than the q_len 1 balance gains)
-#endif
-#ifndef OKC_SEGK8
-#define OKC_SEGK8 600   // flat q_len 8: virtual keys per request boundary in the partition (b16 107.4 -> 103, b32 187.4 -> 184)
-#endif
-#ifndef OKC_SEGK1
-#define OKC_SEGK1 400   // flat q_len 1: the same (b16 90.4 -> 88.7)
-#endif
-#ifndef OKC_W0SPREAD
-#define OKC_W0SPREAD 0  // W0 registration barrier over 8 arrival counters (measured slower: 8 sequential polls)
-#endif
-#ifndef OKC_W0EARLY
-#define OKC_W0EARLY 1   // the W0 registration atomics issued before the prefix sums (warp 1), the wait after them
-#endif
-#ifndef OKC_W0FORCEBAD
+#define OKC_PCHKTEST 0  // test hook for OKC_PCHK: an offset move on most tiles
+#define OKC_UNEV 0      // OFF: per-request coop grids with more splits than SMs -- uneven tiles by dispatch wave (w0)
+#define OKC_W0L1 0      // OFF: per-SM uneven shares for the non-cooperative (q_len-1) flat grids too
+#define OKC_SEGK8 600   // flat q_len-8: virtual keys charged per request boundary in the partition
+#define OKC_SEGK1 400   // flat q_len-1: same
+#define OKC_W0SPREAD 0  // OFF: W0 registration barrier over 8 arrival counters
+#define OKC_W0EARLY 1   // W0 registration atomics issued before the prefix sums (warp 1), the wait after them
 #define OKC_W0FORCEBAD 0  // test only: force the W0 registration's fallback (every CTA takes the even split)
-#endif
-#ifndef OKC_W0BID
-#define OKC_W0BID 1     // rank the two CTAs of an SM by blockIdx (the lower one gets the warp schedulers' priority:
-                        // it finishes first on every SM) instead of by arrival
-#endif
-#ifndef OKC_W0ENABLE
-#define OKC_W0ENABLE 0  // flat coop (q_len 8): uneven shares for the two CTAs of each SM (see OKC_W0_L8)
-#endif
-#ifndef OKC_CLR2
-#define OKC_CLR2 1      // cluster epilogue: compact (item, peer) DSMEM reduction with shuffles
-#endif
-#ifndef OKC_DBGON
-#define OKC_DBGON 0     // phase timestamps (diagnostic builds): compiled out, the checks cost cold instructions
-#endif
-#ifndef OKC_BALPART
-#define OKC_BALPART 0   // flat: balanced integer shares (one 32-bit division) instead of c*T/G
-#endif
-#ifndef OKC_CONT
-#define OKC_CONT 0      // flat producer mode: one continuous stage pipeline across segments (no drain per segment)
-#endif
-#ifndef OKC_DYN
-#define OKC_DYN 0       // flat producer mode: dynamic chunks claimed from a global counter (needs OKC_CONT)
-#endif
-#ifndef OKC_DYNK
-#define OKC_DYNK 3      // chunks per CTA
-#endif
-#if OKC_DYN && !OKC_CONT
-#error "OKC_DYN needs OKC_CONT"
-#endif
-#ifndef OKC_FINWARM
-#define OKC_FINWARM 0   // dry call of the last-CTA finalize during the prologue (instruction cache warm-up)
-#endif
-#ifndef OKC_PVW1
-#define OKC_PVW1 1      // flat q_len 8: wait for the previous PV wgmma before the V transpose (frees its registers)
-#endif
-#ifndef OKC_NOXCH1
-#define OKC_NOXCH1 0    // q_len 1, workspace merge: no smem exchange of the two key halves (both reduce; measured slower)
-#endif
-#ifndef OKC_TANHSIG
-#define OKC_TANHSIG 0   // gate sigmoid via tanh.approx (fewer cold instructions in the finalizes)
-#endif
-#ifndef OKC_PVSPLIT
-#define OKC_PVSPLIT 1   // q8 PV: each half issued as soon as its P is packed; 1: waited at the tile end (no ptxas C7515
-                        // wgmma serialization: nothing in flight across the loop edge), 2: at the next tile's top
-#endif
-#ifndef OKC_QKZ
-#define OKC_QKZ 0       // q8 QK^T: first wgmma with write-only accumulators (not needed for C7515; QKZ=0 vf32 -0.4%)
-#endif
-#ifndef OKC_XP_NORESC
-#define OKC_XP_NORESC 0 // timing/compile experiment only (wrong results): no O rescale on an offset move
-#endif
-#ifndef OKC_INV2
+#define OKC_W0BID 1     // rank the two CTAs of an SM by blockIdx (the lower one gets the warp schedulers' priority) instead of by arrival
+#define OKC_W0ENABLE 0  // OFF: flat coop (q_len-8) uneven shares for the two CTAs of each SM
+#define OKC_DBGON 0     // debug: phase timestamps (compiled out; the checks cost cold instructions)
+#define OKC_BALPART 0   // OFF: flat balanced integer shares (one 32-bit division) instead of c*T/G
+#define OKC_CONT 0      // OFF: flat producer mode -- one continuous stage pipeline across segments (no drain per segment)
+#define OKC_DYN 0       // OFF: flat producer mode -- dynamic chunks claimed from a global counter (needs OKC_CONT)
+#define OKC_FINWARM 0   // OFF: dry call of the last-CTA finalize during the prologue (instruction-cache warm-up)
+#define OKC_PVW1 1      // flat q_len-8: wait for the previous PV wgmma before the V transpose (frees its registers)
+#define OKC_NOXCH1 0    // OFF: q_len-1 workspace merge -- no smem exchange of the two key halves (both reduce)
+#define OKC_PVSPLIT 1   // q8 PV: each half issued as soon as its P is packed (1: waited at the tile end, 2: at the next tile's top)
+#define OKC_QKZ 0       // OFF: q8 QK^T -- first wgmma with write-only accumulators
 #define OKC_INV2 1      // per-tile invariants: hk / wsub / hi_all as lane-0 broadcasts, vld_off1 as vld_off0 ^ 32
-#endif
-#ifndef OKC_OZF
-#define OKC_OZF 1       // q8: fence the O / row-sum zero init before the tile loop (scout: the C7515 trigger)
-#endif
-#ifndef OKC_XP_ARRALL
-#define OKC_XP_ARRALL 1 // every consumer thread arrives on the stage-empty barriers (compute-sanitizer racecheck clean; the one-lane
-                        // arrive after bar.sync / __syncwarp was flagged on every ring reuse; vf32 -0.8%)
-#endif
-#ifndef OKC_XP_MASKRO
-#define OKC_XP_MASKRO 0 // compile experiment only
-#endif
-#ifndef OKC_XP_NOMASK
-#define OKC_XP_NOMASK 0 // timing/compile experiment only (wrong results): no per-element masks
-#endif
-#ifndef OKC_IRANGE
-#define OKC_IRANGE 0    // q8 loop: interior-tile test as one unsigned compare on the tile index (range found once; neutral)
-#endif
-#ifndef OKC_PATCHNI
-#define OKC_PATCHNI 1   // q8 flat loop: the rare new-row patch as a noinline call (no hoisted bounds math per tile; -1.5%)
-#endif
-#ifndef OKC_DSHFL
-#define OKC_DSHFL 1     // q8 flat loop: wgmma descriptor bases broadcast via shuffles (kept in uniform registers)
-#endif
-#ifndef OKC_PARITY
+#define OKC_OZF 1       // q8: fence the O / row-sum zero init before the tile loop
+#define OKC_XP_ARRALL 1 // every consumer thread arrives on the stage-empty barriers (racecheck-clean)
+#define OKC_XP_NOMASK 0 // OFF: timing/compile experiment only (wrong results) -- no per-element masks
+#define OKC_IRANGE 0    // OFF: q8 loop -- interior-tile test as one unsigned compare on the tile index
+#define OKC_PATCHNI 1   // q8 flat loop: the rare new-row patch as a noinline call (no hoisted bounds math per tile)
 #define OKC_PARITY 1    // per-request coop barrier: per-launch alternating counters (no departure counter)
-#endif
-#ifndef OKC_SENSE2
-#define OKC_SENSE2 0    // per-request coop barrier: sense-reversing with the flag read in the prologue (slower: the flag store delays the waiters)
-#endif
-#ifndef OKC_UNRN
-#define OKC_UNRN 1      // q_len 8 loop unroll in the plain split-KV per-request kernel (b32 q8 sliding -0.5 us)
-#endif
-#ifndef OKC_ADDRN
-#define OKC_ADDRN 1     // OKC_ADDR in the per-request kernels too (few tiles per CTA: the hoisting does not pay)
-#endif
-#ifndef OKC_OFF32
+#define OKC_SENSE2 0    // OFF: per-request coop barrier -- sense-reversing with the flag read in the prologue
+#define OKC_UNRN 1      // q_len-8 loop unroll in the plain split-KV per-request kernel
+#define OKC_ADDRN 1     // OKC_ADDR in the per-request kernels too
 #define OKC_OFF32 1     // 32-bit index math for qkv / workspace / caches (host-checked sizes)
-#endif
-#ifndef OKC_UNR8
-#define OKC_UNR8 2      // q_len 8 flat loop unroll (2: the V^T buffer / stage parity become constants per copy; -4.5%)
-#endif
-#ifndef OKC_RED4
-#define OKC_RED4 1      // q_len 8 workspace merge with 16-byte atomics (lane-pair swaps)
-#endif
-#ifndef OKC_SWAPHALF
-#define OKC_SWAPHALF 0
-#endif
-#ifndef OKC_LATESYNC
-#define OKC_LATESYNC 1  // with OKC_PK2 (flat): the V^T proxy fence and warpgroup barrier move from after the transpose to
-                        // just before the PV issue (each warp runs its exponentials without waiting for the others' V^T)
-#endif
-#ifndef OKC_LATESYNCN
-#define OKC_LATESYNCN 1 // OKC_LATESYNC for the per-request q8 kernels (split PV): the V^T proxy fence and warpgroup barrier
-                        // just before the first PV half instead of right after the transpose
-#endif
-#ifndef OKC_QKFIRST
-#define OKC_QKFIRST 1   // per-request kernels (one tile stream): the tile's QK^T wgmma issued right after the stage barrier,
-                        // before this thread's K/V copies for tile i + STAGES - 1 (they refill tile i-1's stage, which no
-                        // wgmma of tile i reads), so the tensor core starts while the copy instructions issue
-#endif
-#ifndef OKC_FPART
-#define OKC_FPART 1     // q_len 1 flat grids (<= 32 requests: ballots): warp 0 computes this CTA's key range and segment list
-                        // right after its prefix sums (no all-thread binary search, no serial scan by thread 0, one barrier
-                        // less: v288 vf16 spent 1.18 us between the prefix sums and the segment list)
-#endif
-#ifndef OKC_EARLYBAR
-#define OKC_EARLYBAR 1  // flat producer mode: the first segment's stage barriers set up at kernel start (in the shadow of the
-                        // seq_lens load) instead of after the partition (one init + CTA barrier off the critical path)
-#endif
-#ifndef OKC_PTPF
-#define OKC_PTPF 1      // (with OKC_FPART) warp 0 prefetches the first segment's first STAGES tiles of page indices into L2
-                        // as soon as the segment list is known (the producers' index loads then hit L2)
-#endif
-#ifndef OKC_FPRO
-#define OKC_FPRO 0      // (debug) flat prologue stamps in dbg slots 40-44 (needs OKC_SEGDBG=1: stride 64)
-#endif
+#define OKC_UNR8 2      // q_len-8 flat loop unroll (2: the V^T buffer / stage parity become constants per copy)
+#define OKC_RED4 1      // q_len-8 workspace merge with 16-byte atomics (lane-pair swaps)
+#define OKC_SWAPHALF 0  // OFF: experiment -- the first-dispatched half of the grid takes the second half of the keys
+#define OKC_LATESYNC 1  // with OKC_PK2 (flat): the V^T proxy fence and warpgroup barrier move from after the transpose to just before the PV issue
+#define OKC_LATESYNCN 1 // OKC_LATESYNC for the per-request q8 kernels (split PV): the fence/barrier move to just before the first PV half
+#define OKC_QKFIRST 1   // per-request kernels (one tile stream): the tile's QK^T wgmma issued right after the stage barrier, before this thread's K/V copies for tile i + STAGES - 1, so the tensor core starts while the copy instructions issue
+#define OKC_FPART 1     // q_len-1 flat grids (<= 32 requests): warp 0 computes this CTA's key range and segment list right after its prefix sums
+#define OKC_EARLYBAR 1  // flat producer mode: the first segment's stage barriers set up at kernel start, in the shadow of the seq_lens load
+#define OKC_PTPF 1      // with OKC_FPART: warp 0 prefetches the first segment's first STAGES tiles of page indices into L2
+#define OKC_FPRO 0      // debug: flat prologue stamps in dbg slots 40-44 (needs OKC_SEGDBG=1: stride 64)
 #define FPRO_STAMP(k) do { if (OKC_FPRO && p.dbg) { long long* _dp = p.dbg + (blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * DBGSTRIDE + (k); if (*_dp == 0) *_dp = gtime(); } } while (0)
-#ifndef OKC_COOPGUARD
-#define OKC_COOPGUARD 1 // host: a cooperative (grid-barrier) launch only when the instance actually launched (ONE / SPEC
-                        // builds have their own register counts) holds the whole grid, else plain split-KV; device: the
-                        // grid barriers trap after 1 s instead of spinning forever (never a hang on any data or node)
-#endif
+#define OKC_COOPGUARD 1 // host: a cooperative (grid-barrier) launch only when the instance actually launched holds the whole grid, else plain split-KV; device: grid barriers trap after 1 s instead of spinning forever
 __device__ __noinline__ void spin_fail() { __trap(); }   // (out of line: keeps the trap off the polling loop's code)
 #define SPIN_T0 unsigned _spin_n = 0   /* (an iteration count: a %globaltimer read per poll slowed the coop barriers ~1%) */
 #define SPIN_CHECK do { if (OKC_COOPGUARD && ++_spin_n > (1u << 24)) spin_fail(); } while (0)   /* (>= 2^24 global polls: seconds) */
-#ifndef OKC_PK2
-#define OKC_PK2 1       // q8 FP8 PV with the packed-P offset test: both halves' exponentials as one straight-line block
-                        // (32 independent FMA -> MUFU -> pack chains instead of two 16-chain passes split by a vote and
-                        // a PV issue), one offset test for the tile, both PV halves issued together
-#endif
-#ifndef OKC_YIELD
-#define OKC_YIELD 0     // flat kernels: ns the first-dispatched CTA's consumers sleep per tile (fairness experiment)
-#endif
-#ifndef OKC_ST1F
-#define OKC_ST1F 3      // q_len 1 flat kernel: pipeline stages (3 measured best: b16 full 93 -> 91.5 us vs 6)
-#endif
-#ifndef OKC_STN
+#define OKC_PK2 1       // q8 FP8 PV with the packed-P offset test: both halves' exponentials as one straight-line block (one offset test for the tile, both PV halves issued together)
+#define OKC_ST1F 3      // q_len-1 flat kernel: pipeline stages
 #define OKC_STN 3       // per-request kernels: pipeline stages
-#endif
-#ifndef OKC_PACK4
-#define OKC_PACK4 0     // e4m3x4 packing in PTX (same SASS: ptxas already merges the halves with F2FP.MERGE_C)
-#endif
-#ifndef OKC_UARGS
-#define OKC_UARGS 1
-#endif
-#ifndef OKC_UWARP
-#define OKC_UWARP 1
-#endif
-#ifndef OKC_INEW
-#define OKC_INEW 0      // q_len 8 flat loop: the new-row patch test as one compare (first such tile found per segment; measured slower)
-#endif
-#ifndef OKC_ADDR
-#define OKC_ADDR 1      // q_len 8 loop: loop-carried stage / phase / descriptors / V^T buffer (fewer address ops per tile;
-                        // slower before OKC_UWARP/UARGS (vector registers), -1% since (uniform registers))
-#endif
-#ifndef OKC_FASTSC
-#define OKC_FASTSC 1    // RoPE: reduced angle + hardware sin / cos instead of the accurate sincosf
-#endif
-#ifndef OKC_STSM
-#define OKC_STSM 0      // q_len 8 FP8 PV: V^T stores via stmatrix (2 per thread per tile instead of 8; measured ~1.5% slower)
-#endif
-#ifndef OKC_STSMPR
-#define OKC_STSMPR 1    // ... in the per-request kernels (where it wins)
-#endif
-#ifndef OKC_TCHUNK
+#define OKC_UARGS 1     // per-segment values as lane-0 broadcasts (provably warp-uniform, so ptxas keeps the address math in uniform registers)
+#define OKC_UWARP 1     // the warp index as a lane-0 broadcast (provably warp-uniform)
+#define OKC_INEW 0      // OFF: q_len-8 flat loop -- the new-row patch test as one compare (first such tile found per segment)
+#define OKC_ADDR 1      // q_len-8 loop: loop-carried stage / phase / descriptors / V^T buffer (fewer address ops per tile)
+#define OKC_STSM 0      // OFF: q_len-8 FP8 PV -- V^T stores via stmatrix (2 per thread per tile instead of 8)
+#define OKC_STSMPR 1    // stmatrix V^T stores in the per-request kernels
 #define OKC_TCHUNK 1    // per-request splits: whole 64-key tiles per CTA
-#endif
-#ifndef OKC_EXPPOLY
-#define OKC_EXPPOLY 0   // q_len 8 FP8 PV: how many of every 4 exponentials run on the FMA pipe (0..4; measured slower: issue-bound)
-#endif
-#ifndef OKC_EXH8
-#define OKC_EXH8 0      // q_len 8 FP8 PV: exponentials as packed f16 pairs (experiment)
-#endif
-#ifndef OKC_LAZY1
-#define OKC_LAZY1 0     // q_len 1: lazily moved softmax offset (no per-tile rescale or row-max shuffles; measured neutral)
-#endif
-#ifndef OKC_NOSYNC0
-#define OKC_NOSYNC0 1   // flat q_len 8 FP8 PV: no warpgroup barrier at the start of each tile
-#endif
-#ifndef OKC_LAZYMAX
-#define OKC_LAZYMAX 1   // q_len 8 sm_90: no per-tile row-max shuffles (only for the rare offset move)
-#endif
-#ifndef OKC_QROLL
-#define OKC_QROLL 0     // prologue: the query passes as a loop instead of unrolled
-#endif
-#ifndef OKC_CLR4
-#define OKC_CLR4 1      // q_len 8 cluster epilogue: DSMEM loads in groups of 4 peers (compact code)
-#endif
-#ifndef OKC_SENSE
-#define OKC_SENSE 0     // coop finalizes: sense-reversing barriers (no departure counter round trip at the end)
-#endif
-#ifndef OKC_WSPLIT
+#define OKC_EXPPOLY 0   // OFF: q_len-8 FP8 PV -- how many of every 4 exponentials run on the FMA pipe (0..4)
+#define OKC_EXH8 0      // OFF: q_len-8 FP8 PV -- exponentials as packed f16 pairs (experiment)
+#define OKC_NOSYNC0 1   // flat q_len-8 FP8 PV: no warpgroup barrier at the start of each tile
+#define OKC_LAZYMAX 1   // q_len-8: no per-tile row-max shuffles (only for the rare offset move)
+#define OKC_SENSE 0     // OFF: coop finalizes -- sense-reversing barriers (no departure counter round trip at the end)
 #define OKC_WSPLIT 500  // flat: per mille of the keys for the first half of the grid (500 = even)
-#endif
-#ifndef OKC_F2
-#define OKC_F2 0        // q_len 8 flat: one CTA per SM, two streams claiming tiles per KV head (measured slower: one producer warpgroup per SM limits)
-#endif
-#ifndef OKC_S2
-#define OKC_S2 0        // q_len 8 per-request kernels: two tile streams per CTA, one CTA per SM (measured slower)
-#endif
-#ifndef OKC_PTR
-#define OKC_PTR 0       // flat q_len 8: the producer warps build V^T (measured much slower: the producers stall on their copies)
-#endif
-#ifndef OKC_PTRD
-#define OKC_PTRD 2      // OKC_PTR: tile y is transposed after the copies of tile y + OKC_PTRD are issued
-#endif
-#ifndef OKC_XP_NOTR
-#define OKC_XP_NOTR 0      // timing experiments only (wrong results): skip the V transpose
-#endif
-#ifndef OKC_XP_NOFENCE
-#define OKC_XP_NOFENCE 0   // timing experiments only: skip the proxy fence after the transpose
-#endif
-#ifndef OKC_XP_NOEXP
-#define OKC_XP_NOEXP 0     // timing experiments only: P = scores (no exponentials)
-#endif
-#ifndef OKC_PROFPV8
-#define OKC_PROFPV8 0   // profile builds: keep the FP8 PV path
-#endif
-#ifndef OKC_SMDBG
-#define OKC_SMDBG 0     // diagnostic builds: record %smid of every CTA in debug slot 15
-#endif
-#ifndef OKC_CLDBG
-#define OKC_CLDBG 0
-#endif
-#ifndef OKC_PROFDEP
-#define OKC_PROFDEP 0
-#endif
-#ifndef OKC_SPINDBG
-#define OKC_SPINDBG 0
-#endif
+#define OKC_F2 0        // OFF: q_len-8 flat -- one CTA per SM, two streams claiming tiles per KV head
+#define OKC_S2 0        // OFF: q_len-8 per-request kernels -- two tile streams per CTA, one CTA per SM
+#define OKC_PTR 0       // OFF: flat q_len-8 -- the producer warps build V^T
+#define OKC_PTRD 2      // with OKC_PTR: tile y is transposed after the copies of tile y + OKC_PTRD are issued
+#define OKC_XP_NOTR 0      // OFF: timing experiment only (wrong results) -- skip the V transpose
+#define OKC_XP_NOFENCE 0   // OFF: timing experiment only -- skip the proxy fence after the transpose
+#define OKC_XP_NOEXP 0     // OFF: timing experiment only -- P = scores (no exponentials)
+#define OKC_CLDBG 0     // debug: cluster timestamps (1: stamps, 2: repeat the timed region)
+#define OKC_SPINDBG 0    // debug: coop wait -- report and give up instead of hanging
 template <int L, bool F>
 struct Cfg {
   // q_len 8 per-request kernels on sm_90 with FP8 PV: two tile streams per CTA (warps 8..15 take the odd tiles), one
@@ -593,22 +349,12 @@ __device__ __forceinline__ void cp_async16_pred(uint32_t dst, const void* src, i
 __device__ __forceinline__ void cp_async4(uint32_t dst, const void* src) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(src));
 }
-__device__ __forceinline__ void cp_async4z(uint32_t dst, const void* src, int src_bytes) {   // (0: zero-fill)
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(dst), "l"(src), "r"(src_bytes));
-}
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 
-#ifndef OKC_TMA
 #define OKC_TMA 0
-#endif
 // ---- sm_90 TMA row loads tracked by one mbarrier per pipeline stage ----
-__device__ __forceinline__ void mbar_init(uint64_t* bar) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(bar)) : "memory");
-#endif
-}
 __device__ __forceinline__ void mbar_fence_init() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -617,16 +363,6 @@ __device__ __forceinline__ void mbar_fence_init() {
 __device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, int bytes) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
-#endif
-}
-__device__ __forceinline__ void mbar_wait(uint64_t* bar, int parity) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  for (int spin = 0; spin < (1 << 16); ++spin) {   // bounded: a broken phase gives wrong results, never a hang
-    uint32_t ok;
-    asm volatile("{\n.reg .pred q;\nmbarrier.try_wait.parity.shared::cta.b64 q, [%1], %2;\nselp.u32 %0, 1, 0, q;\n}\n"
-                 : "=r"(ok) : "r"(smem_u32(bar)), "r"(parity) : "memory");
-    if (ok) break;
-  }
 #endif
 }
 __device__ __forceinline__ void mbar_init_n(uint64_t* bar, int count) {
@@ -659,13 +395,6 @@ __device__ __forceinline__ void bulk_load(void* dst, const void* src, int bytes,
                ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
 #endif
 }
-// one 64-entry box of a 1-D int32 tensor map into shared memory (TMA), completion on an mbarrier
-__device__ __forceinline__ void tma_load_1d(void* dst, const CUtensorMap* map, int c0, uint64_t* bar) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("cp.async.bulk.tensor.1d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2}], [%3];\n"
-               ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(smem_u32(bar)) : "memory");
-#endif
-}
 // 16 zero bytes into shared memory through the same cp.async path (no global read)
 __device__ __forceinline__ void cp_async16_zero(uint32_t dst, const void* any_src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 0;\n" ::"r"(dst), "l"(any_src));
@@ -681,12 +410,6 @@ template <bool WS, int NT>
 __device__ __forceinline__ void csync() {
   if constexpr (WS) asm volatile("bar.sync 1, %0;\n" ::"n"(NT) : "memory");
   else __syncthreads();
-}
-__device__ __forceinline__ void tma_row(void* dst, const CUtensorMap* map, int x, int y, uint64_t* bar) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
-               ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(smem_u32(bar)) : "memory");
-#endif
 }
 
 __device__ __forceinline__ float ex2(float x) {
@@ -726,32 +449,12 @@ __device__ __forceinline__ uint32_t pack_h2(float lo, float hi) {
 }
 // 2^lo, 2^hi as a packed f16 pair: the inputs rounded to f16 (|x| <= 8 here: error <= 2^-8), one MUFU op
 __device__ __forceinline__ uint32_t ex2h2(float lo, float hi) {
-#if OKC_P8EMU
-  // accuracy experiment: P rounded to e4m3 (as an FP8 PV MMA would see it), then back to f16
-  {
-    uint16_t q8;
-    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(q8) : "f"(ex2(lo)), "f"(ex2(hi)));
-    uint32_t h;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(q8));
-    return h;
-  }
-#endif
-#if OKC_EXH2
-  uint32_t x = pack_h2(lo, hi), y;
-  asm("ex2.approx.f16x2 %0, %1;" : "=r"(y) : "r"(x));
-  return y;
-#else
   return pack_h2(ex2(lo), ex2(hi));
-#endif
 }
 // conformance sensitivity probe only (-DOKC_PROBE_O8=1): round the attention output, which SGLang keeps in
 // BF16 before rmsnorm * gate, to e4m3 -- the precision check must reject that build
 __device__ __forceinline__ float pr8(float x) {
-#if OKC_PROBE_O8
-  return __half2float(__nv_cvt_fp8_to_halfraw(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3), __NV_E4M3));
-#else
   return x;
-#endif
 }
 __device__ __forceinline__ uint8_t to_e4m3(float x) {
   return (uint8_t)__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
@@ -766,20 +469,6 @@ __device__ __forceinline__ void mma_f16(float* c, uint32_t a0, uint32_t a1, uint
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// m16n8k32 e4m3 x e4m3 -> f32 (sm_89+); emulated with two f16 MMAs elsewhere.
-__device__ __forceinline__ void mma_fp8(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-                                        uint32_t b0, uint32_t b1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-  asm volatile(
-      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-      "{%0,%1,%2,%3};\n"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-#else
-  mma_f16(c, cvt2(a0), cvt2(a1), cvt2(a0 >> 16), cvt2(a1 >> 16), cvt2(b0), cvt2(b0 >> 16));
-  mma_f16(c, cvt2(a2), cvt2(a3), cvt2(a2 >> 16), cvt2(a3 >> 16), cvt2(b1), cvt2(b1 >> 16));
-#endif
-}
 
 __device__ __forceinline__ uint4 lds128(const uint8_t* p) { return *reinterpret_cast<const uint4*>(p); }
 __device__ __forceinline__ uint2 lds64(const uint8_t* p) { return *reinterpret_cast<const uint2*>(p); }
@@ -807,11 +496,7 @@ __device__ __forceinline__ void load_v_frags(const uint8_t* V, int kb, int hk, i
 // OKC_FENCEAR: the merge / barrier fences as fence.acq_rel.gpu (MEMBAR.ALL.GPU) instead of __threadfence()'s
 // fence.sc.gpu (MEMBAR.SC.GPU + ERRBAR + CCTL.IVALL): the message-passing pattern needs release / acquire only
 __device__ __forceinline__ void gpu_fence() {
-#if OKC_FENCEAR
-  asm volatile("fence.acq_rel.gpu;" ::: "memory");
-#else
   __threadfence();
-#endif
 }
 __device__ __forceinline__ void red_f32(float* a, float x) {
   asm volatile("red.global.add.f32 [%0], %1;" ::"l"(a), "f"(x) : "memory");
@@ -851,23 +536,10 @@ __device__ __forceinline__ void stsm_x4(uint32_t addr, uint32_t r0, uint32_t r1,
 }
 
 // ---- per-warp phase profile of the main loops (diagnostic builds only: -DOKC_PROF=1) ----
-#ifndef OKC_PROF
-#define OKC_PROF 0
-#endif
-#if OKC_PROF
-#define PROF_INIT long long _pt = clock64(); long long _pa[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-#define PROF_MARK(k) do { const long long _t = clock64(); _pa[k] += _t - _pt; _pt = _t; } while (0)
-#define PROF_TILE (_pa[7] += 1)
-#define PROF_DUMP do { if (p.dbg && lane == 0) { \
-    const int _w = (blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * (blockDim.x / 32) + warp; \
-    for (int _k = 0; _k < 8; ++_k) atomicAdd(reinterpret_cast<unsigned long long*>(p.dbg + 65536 + _w * 8 + _k), \
-                                             (unsigned long long)_pa[_k]); } } while (0)
-#else
 #define PROF_INIT
 #define PROF_MARK(k)
 #define PROF_TILE
 #define PROF_DUMP
-#endif
 
 // ---- sm_90 warpgroup MMA helpers ----
 __device__ __forceinline__ void fence_proxy_async() {
@@ -978,41 +650,10 @@ __device__ __forceinline__ int fdiv_i(int x, int d) {
   q += (r >= d) - (r < 0);
   return q;
 }
-// 2^x for four floats -> four e4m3 bytes, through packed f16 exponentials (2 MUFU ops instead of 4). The f16
-// exponent result (10-bit mantissa) is rounded to e4m3 (3-bit mantissa) right after, like the f32 path's result.
-__device__ __forceinline__ uint32_t ex2_e4m3x4_h(float x0, float x1, float x2, float x3) {
-  uint32_t a, b, ea, eb;
-  asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(a) : "f"(x0), "f"(x1));
-  asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(b) : "f"(x2), "f"(x3));
-  asm("ex2.approx.f16x2 %0, %1;" : "=r"(ea) : "r"(a));
-  asm("ex2.approx.f16x2 %0, %1;" : "=r"(eb) : "r"(b));
-  uint16_t lo, hi;
-  asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(lo) : "r"(ea));
-  asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(hi) : "r"(eb));
-  return (uint32_t)lo | ((uint32_t)hi << 16);
-}
 // sigmoid for the output gate: 0.5 + 0.5 tanh(x / 2) with the hardware tanh (3 instructions; abs error ~2^-12,
 // below the BF16 output's rounding) or exp + fast reciprocal
 __device__ __forceinline__ float sigm(float x) {
-#if OKC_TANHSIG
-  float t;
-  asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(0.5f * x));
-  return fmaf(0.5f, t, 0.5f);
-#else
   return __fdividef(1.f, 1.f + __expf(-x));
-#endif
-}
-// 2^x on the FMA pipe (FlashAttention-4 style, to balance the MUFU unit): x clamped to >= -127, x = j + f with
-// j = floor(x), 2^f by a degree-3 minimax polynomial on [0, 1) (rel. error ~9e-5, far below the e4m3 rounding of P),
-// j added into the exponent bits
-__device__ __forceinline__ float ex2_poly(float x) {
-  x = fmaxf(x, -127.f);
-  const float j = floorf(x);
-  const float f = x - j;
-  float p = fmaf(f, 0.0790209f, 0.2249424f);
-  p = fmaf(f, p, 0.6960656f);
-  p = fmaf(f, p, 0.9999893f);
-  return __int_as_float(__float_as_int(p) + ((int)j << 23));
 }
 // Programmatic dependent launch (sm_90): wait for the preceding grid (the one writing qkv) before the first qkv read;
 // let the next grid start its own prologue once the main loop is done. Both are no-ops for a plain launch.
@@ -1030,15 +671,9 @@ __device__ __forceinline__ void pdl_launch_dependents() {
 }
 // OKC_OFF32: 32-bit offsets for qkv, the workspace and the caches (the host checks the sizes): no 64-bit multiplies
 // in the once-per-launch address math
-#if OKC_OFF32
 typedef int ix_t;
-#else
-typedef int64_t ix_t;
-#endif
 __device__ __forceinline__ const uint8_t* cache_row(const uint8_t* base, const Params& p, int64_t row, int col_bytes) {
-#if OKC_OFF32
   if (p.off32) return base + (((uint32_t)row << p.lrb) + (uint32_t)col_bytes);
-#endif
   return base + row * p.row_bytes + col_bytes;
 }
 // `for (e = tid; e < N; e += NTH)` with a compile-time trip count: fully unrolled, the tail predicated (the
@@ -1053,39 +688,10 @@ __device__ __forceinline__ void tfor(int tid, F&& f) {
 }
 // four floats -> four e4m3 bytes (x0 in the low byte), saturating
 __device__ __forceinline__ uint32_t e4m3x4f(float x0, float x1, float x2, float x3) {
-#if OKC_PACK4
-  // both halves packed in PTX (mov.b32 {lo, hi}): ptxas can place the two conversions in one register's halves
-  // instead of a shift + or
-  uint32_t r;
-  asm("{\n.reg .b16 l, h;\n"
-      "cvt.rn.satfinite.e4m3x2.f32 l, %2, %1;\n"
-      "cvt.rn.satfinite.e4m3x2.f32 h, %4, %3;\n"
-      "mov.b32 %0, {l, h};\n}"
-      : "=r"(r) : "f"(x0), "f"(x1), "f"(x2), "f"(x3));
-  return r;
-#else
   uint16_t lo, hi;
   asm("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(lo) : "f"(x0), "f"(x1));
   asm("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(hi) : "f"(x2), "f"(x3));
   return (uint32_t)lo | ((uint32_t)hi << 16);
-#endif
-}
-// D[64x64] (+)= A[64x16] (f16, registers) * B[16x64] (f16, shared memory, MN-major 128B swizzle: tnspB = 1)
-__device__ __forceinline__ void wgmma_m64n64k16_f16_tb(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-                                                       uint64_t desc) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile(
-      "{\n"
-      "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
-      "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
-      "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, "
-      "{%32, %33, %34, %35}, %36, 1, 1, 1, 1;\n}\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-        "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-        "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-        "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
-#endif
 }
 // four f16 (two f16x2 words, low first) -> four e4m3 bytes (low byte first)
 __device__ __forceinline__ uint32_t pack_e4m3x4(uint32_t h01, uint32_t h23) {
@@ -1340,7 +946,6 @@ __device__ __forceinline__ void cluster_finish(const Params& p, SM& S, const int
   long long dbgc0 = 0;
   if (OKC_CLDBG) asm volatile("mov.u64 %0, %%clock64;" : "=l"(dbgc0));
   const int row0 = rank * RPC;
-#if OKC_CLR2
   if constexpr (L == 1) {   // compact reduction (this code runs once per launch from a cold instruction cache, so it is kept short):
       // (row, slot) items -- 16 float4 slots of o and one for l -- times the CS peers; CS consecutive lanes load
       // one item from every peer and sum it with shuffles. Two items per thread per pass keep loads in flight.
@@ -1387,10 +992,8 @@ __device__ __forceinline__ void cluster_finish(const Params& p, SM& S, const int
     }
     }
   } else
-#endif
   {
   constexpr int CSMAX = 16;
-#if OKC_CLR4
   // compact: peers in groups of 4 (one loop body, warm after its first pass: this code runs once per launch)
   for (int e = tid; e < RPC * 16; e += NT) {
     const int off = (row0 + (e >> 4)) * 64 + (e & 15) * 4;
@@ -1417,7 +1020,6 @@ __device__ __forceinline__ void cluster_finish(const Params& p, SM& S, const int
     if (lrow) RL[e >> 4] = la;
   }
   if (false)
-#endif
   for (int e = tid; e < RPC * 16; e += NT) {
     const int off = (row0 + (e >> 4)) * 64 + (e & 15) * 4;
     const bool lrow = (e & 15) == 0;   // the row's first thread also sums the row's l (same DSMEM round)
@@ -1686,11 +1288,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   // the caller re-runs the segment with the real length)
   // per-segment values as lane-0 broadcasts (OKC_UARGS): provably warp-uniform, so ptxas keeps the address math
   // derived from them in uniform registers (they come from shared memory or per-CTA math, uniform but unproven)
-#if OKC_UARGS
 #define UNI(x) __shfl_sync(0xffffffffu, (x), 0)
-#else
-#define UNI(x) (x)
-#endif
   const int b = UNI(b_), pair = UNI(pair_), start = UNI(start_), end = UNI(end_), seq = UNI(seq_);
   const int n_keys = UNI(n_keys_), copy = UNI(copy_), chunk = UNI(chunk_), tb = UNI(tb_);
 #undef UNI
@@ -1750,12 +1348,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       const int* ptr = p.page_table + (ix_t)b * p.max_pages;
       const int cache_end = min(end, seq);
       int pg[PK];
-#if OKC_PFAST
       static_assert(PR % 8 == 0, "PFAST: the swizzle chunk is the same for all of a thread's rows");
       const bool pfast = OKC_OFF32 && p.off32 && p.lp == 0;
       const uint32_t pcol = (uint32_t)(pair * 128 + ch * 16);
       const uint32_t pso = r0 * ROWB + ((ch ^ (r0 & 7)) << 4);
-#endif
       // OKC_TMAPG: page indices by TMA (q_len 1 flat only: f16 -2.4%, f32 -1.7%; the q_len 8 flat kernel lost ~0.7%)
       constexpr bool TMAPG_ON = OKC_TMAPG && (L == 1 || OKC_TMAPG8);
       // page indices by TMA: one 64-entry box per tile, PD tiles ahead, PS slots, producer barrier per tile
@@ -1879,7 +1475,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         PROF_MARK(0);
         if (x == 0 && q == 0) FPRO_STAMP(46);
         const uint32_t kb = smem_u32(S.k + st * STAGE_BYTES), vb = smem_u32(S.v + st * STAGE_BYTES);
-#if OKC_PFAST
         // common tiles (every row cached, page size 1, caches below 4 GB): one shift-add per row, no per-row
         // branches (the producer's instructions take issue slots from the consumers on the same SMSPs)
         if (pfast && start + x * TILE + TILE <= cache_end) {
@@ -1890,20 +1485,17 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
             cp_async16(vb + pso + k * (PR * ROWB), p.v_cache + off, 16);
           }
         } else
-#endif
 #pragma unroll
         for (int k = 0; k < PK; ++k) {
           const int r = r0 + PR * k;
           const int pos = start + x * TILE + r;
           const uint32_t so = r * ROWB + ((ch ^ (r & 7)) << 4);
           if (pos < cache_end) {
-#if OKC_OFF32
             if (p.off32) {   // caches below 4 GB: 32-bit offsets (uniform branch)
               const uint32_t off = ((((uint32_t)pg[k] << p.lp) + (uint32_t)(pos & (p.P - 1))) << p.lrb) + (uint32_t)(pair * 128 + ch * 16);
               cp_async16(kb + so, p.k_cache + off, 16);
               cp_async16(vb + so, p.v_cache + off, 16);
             } else
-#endif
             {
               const int64_t off = (((int64_t)pg[k] << p.lp) + (pos & (p.P - 1))) * p.row_bytes + pair * 128 + ch * 16;
               cp_async16(kb + so, p.k_cache + off, 16);
@@ -1957,67 +1549,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     const int st = x % STAGES;
     const int* idxs = &S.idx[(x % IDX_SLOTS) * TILE];
     bool generic = false;   // st.shared into a K stage: the wgmma (async proxy) needs a proxy fence
-#if OKC_TMA
-    const int nv = max(0, min(TILE, min(end, seq) - (start + x * TILE)));   // rows read from the cache
-    if (p.tma) {
-      if (tid == 0) mbar_expect_tx(&S.mbar[st], nv * 2 * ROWB);
-      if (tid < nv) {
-        const int pos = start + x * TILE + tid;
-        const int row = (idxs[tid] << p.lp) + (pos & (p.P - 1));
-        tma_row(S.k + st * STAGE_BYTES + tid * ROWB, &p.tk, pair * 128, row, &S.mbar[st]);
-        tma_row(S.v + st * STAGE_BYTES + tid * ROWB, &p.tv, pair * 128, row, &S.mbar[st]);
-      }
-    }
-#endif
-#if OKC_BRFREE && !OKC_TMA
-    // branch-free on the common path (a taken branch costs 60-100 cycles from a cold instruction cache): cached
-    // rows by cp.async, rows past the range zero-filled by cp.async (src-size 0), the block's own new rows (rare)
-    // by stores; the 32/64-bit offset choice once per call
-    {
-      const uint32_t kst = smem_u32(S.k + st * STAGE_BYTES), vst = smem_u32(S.v + st * STAGE_BYTES);
-      const int t0x = start + x * TILE;
-      auto rows = [&](auto o32) {
-#pragma unroll
-        for (int k = 0; k < TILE / RPP; ++k) {
-          const int r = crow0 + RPP * k;
-          const int pos = t0x + r;
-          const uint32_t so = r * ROWB + ((cchunk ^ (r & 7)) << 4);
-          const bool cached = pos < end && pos < seq;
-          const bool issue = cached || pos >= end;
-          const bool fresh = with_new && !cached && pos < end;
-          const int ix = idxs[r];
-          const uint8_t* ks;
-          const uint8_t* vs;
-          if constexpr (decltype(o32)::value) {
-            const uint32_t off = ((((uint32_t)ix << p.lp) + (uint32_t)(pos & (p.P - 1))) << p.lrb) + (uint32_t)(pair * 128 + cchunk * 16);
-            ks = p.k_cache + off;
-            vs = p.v_cache + off;
-          } else {
-            const int64_t off = (((int64_t)ix << p.lp) + (pos & (p.P - 1))) * p.row_bytes + pair * 128 + cchunk * 16;
-            ks = p.k_cache + off;
-            vs = p.v_cache + off;
-          }
-          if (issue) {
-            cp_async16(kst + so, cached ? ks : p.k_cache, cached ? 16 : 0);
-            cp_async16(vst + so, cached ? vs : p.v_cache, cached ? 16 : 0);
-          }
-          if (fresh) {
-            *reinterpret_cast<uint4*>(S.k + st * STAGE_BYTES + so) = *reinterpret_cast<const uint4*>(S.kn + (pos - seq) * ROWB + cchunk * 16);
-            *reinterpret_cast<uint4*>(S.v + st * STAGE_BYTES + so) = *reinterpret_cast<const uint4*>(S.vn + (pos - seq) * ROWB + cchunk * 16);
-            generic = true;
-          }
-        }
-      };
-#if OKC_OFF32
-      if (p.off32) rows(std::true_type{});
-      else
-#endif
-        rows(std::false_type{});
-      if (L == 8 && generic) fence_proxy_async();
-      return;
-    }
-#endif
-#if OKC_PFASTPR && OKC_OFF32 && !OKC_TMA
     // OKC_PFASTPR: every row of the tile cached (pos < min(end, seq)), page size 1, caches below 4 GB: one shift-add
     // per row, no per-row branches (the per-request issue runs from a cold instruction cache, mostly once)
     if (with_new && p.off32 && p.lp == 0 && start + x * TILE + TILE <= min(end, seq)) {   // (in-loop issues only: the
@@ -2034,7 +1565,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       }
       return;
     }
-#endif
 #pragma unroll
     for (int k = 0; k < TILE / RPP; ++k) {
       const int r = crow0 + RPP * k;
@@ -2043,16 +1573,11 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       uint8_t* dk = S.k + st * STAGE_BYTES + r * ROWB + sw;
       uint8_t* dv = S.v + st * STAGE_BYTES + r * ROWB + sw;
       if (pos < end && pos < seq) {
-#if OKC_TMA
-        if (p.tma) continue;
-#endif
-#if OKC_OFF32
         if (p.off32) {   // caches below 4 GB: 32-bit offsets (uniform branch)
           const uint32_t off = ((((uint32_t)idxs[r] << p.lp) + (uint32_t)(pos & (p.P - 1))) << p.lrb) + (uint32_t)(pair * 128 + cchunk * 16);
           cp_async16(smem_u32(dk), p.k_cache + off, 16);
           cp_async16(smem_u32(dv), p.v_cache + off, 16);
         } else
-#endif
         {
           const int64_t row = ((int64_t)idxs[r] << p.lp) + (pos & (p.P - 1));
           const int64_t off = row * p.row_bytes + pair * 128 + cchunk * 16;
@@ -2073,18 +1598,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     if (L == 8 && generic) fence_proxy_async();
   };
   auto issue_idx = [&](int y) {
-#if OKC_BRFREE
-    // predicated: one select-built copy per thread, invalid entries zero-filled (never read)
-    const int pos = start + y * TILE + prow;
-    const bool val = pos < end && pos < seq;
-    if (phalf == 0 && prow < TILE && y < ntiles)
-      cp_async4z(smem_u32(&S.idx[(y % IDX_SLOTS) * TILE + prow]), val ? pt_row + (pos >> p.lp) : pt_row, val ? 4 : 0);
-#else
     if (phalf == 0 && prow < TILE && y < ntiles) {
       const int pos = start + y * TILE + prow;
       if (pos < end && pos < seq) cp_async4(smem_u32(&S.idx[(y % IDX_SLOTS) * TILE + prow]), pt_row + (pos >> p.lp));
     }
-#endif
   };
   // producer mode: wait for stage `st` (tile i) and write the block's own new keys / values into it
   auto ws_patch = [&](int i, int st) {   // the block's own new rows (positions >= seq) into tile i's stage
@@ -2120,12 +1637,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   };
 
   // ---- 1. page indices of the first STAGES-1 tiles; raw q / k / v rows into registers ----
-#if OKC_TMA
-  if (p.tma && tid == 0) {   // fresh phases per segment (every earlier fill was consumed)
-    for (int st = 0; st < STAGES; ++st) mbar_init(&S.mbar[st]);
-    mbar_fence_init();
-  }
-#endif
   int tidL = tid, partL = part;   // (OKC_LATETID: re-read after the page-index copies are issued)
   constexpr int QPASS = L * 16 / RPP;            // L*16 rows, RPP rows per pass
   const bool has_new = end > seq;
@@ -2133,74 +1644,13 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   constexpr bool QDIR = OKC_QDIRECT && L == 8 && !WS && !Cfg<L, FLAT>::S2 && PV8ON && OKC_QSS && OKC_SM90 && OKC_Q8RAW &&
                         (!FLAT || OKC_PV8FLAT);
   constexpr bool IDXF = OKC_IDXFIRST && !WS && !Cfg<L, FLAT>::S2 && !OKC_PDLKV;
-#if OKC_PDLKV
-  if (__builtin_expect(p.pdlf != 0, 0)) {   // (unlikely: the standalone path falls through, no taken branch)
-    // OKC_PDLKV, PDL launches only (decode_layer): everything the preceding kernel does not write first -- page
-    // indices, the small constants, the first tiles' K/V (past keys) -- then griddepcontrol.wait, so the K/V flight
-    // overlaps the qkv kernel's tail; q and the new k / v (its output) as direct 16-byte loads (each thread stages
-    // the chunk it processes), outside the cp.async groups. (Standalone this order loses: q lands later.)
-    if constexpr (!WS) {
-#pragma unroll
-      for (int y = 0; y < STAGES - 1; ++y) issue_idx(y);
-    }
-    if (tid < 8) cp_async16(smem_u32(&S.ifreq[tid * 4]), p.inv_freq + tid * 4, 16);
-    else if (tid == 8) cp_async4(smem_u32(&S.scl[0]), p.k_scale);
-    else if (tid == 9) cp_async4(smem_u32(&S.scl[1]), p.v_scale);
-    else if ((OKC_SENSE2 || OKC_PARITY) && !FLAT && M_COOP && tid == 10)
-      cp_async4(smem_u32(&S.sense), p.ws_cnt + 24576 + bp);
-    else if (tid >= 16 && tid < 16 + L) {
-      const int jj = tid - 16;
-      asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(smem_u32(&S.cloc[jj])), "l"(p.cache_loc + b * L + jj));
-    }
-    cp_commit();
-    cp_wait<0>();
-    csync<WS, NT>();
-    DBG(1);
-    if constexpr (!WS) {
-      constexpr int PRE = Cfg<L, FLAT>::S2 ? STAGES - 2 : STAGES - 1;
-#pragma unroll 1
-      for (int k = 0; k < STAGES - 1; ++k) {
-        if (k < PRE && k < ntiles) issue_kv(k, false);
-        issue_idx(k + STAGES - 1);
-        if (k < PRE - 1 || k == STAGES - 2) cp_commit();
-      }
-    }
-    DBG(8);
-    pdl_wait();
-    if (M_CL) cluster_stage_gate<L>(p, S, b, pair);
-#pragma unroll
-    for (int ps = 0; ps < QPASS; ++ps) {
-      const int rr = ps * RPP + (tid >> 3);
-      const uint4 v = __ldcg(reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + (rr >> 4)) * p.ld_qkv + (16 * pair + (rr & 15)) * 64 + (tid & 7) * 8));
-      *reinterpret_cast<uint4*>(&S.qst()[rr * 64 + (tid & 7) * 8]) = v;
-    }
-    if (has_new) {
-#pragma unroll
-      for (int ps = 0; ps < KPASS; ++ps) {
-        const int rr = ps * RPP + (tid >> 3);
-        if (rr < L * 4) {
-          const int kind = rr / (2 * L), jj = (rr % (2 * L)) >> 1, hh = rr & 1;
-          const int col = (kind == 0 ? p.Hq : p.Hq + p.Hkv) * 64 + (2 * pair + hh) * 64 + (tid & 7) * 8;
-          *reinterpret_cast<uint4*>(&S.kvst[rr * 64 + (tid & 7) * 8]) =
-              __ldcg(reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + jj) * p.ld_qkv + col));
-        }
-      }
-    }
-    if (split == 0 && (FLAT || !M_CL)) {
-      tfor<L * 16, NT>(tid, [&](int e) {
-        const __nv_bfloat16* gp = p.qkv + (ix_t)(b * L + (e >> 4)) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + (e & 15)) * 64;
-        asm volatile("prefetch.global.L2 [%0];" ::"l"(gp));
-      });
-    }
-  } else
-#endif
   {
   if constexpr (!WS) {
 #pragma unroll
     for (int y = 0; y < STAGES - 1; ++y) issue_idx(y);
   }
   cp_commit();
-  if (OKC_LATETID && !WS && (MODE & 8)) {   // (speculative builds only: Oct 26 01:33, vs1 -3%, vf1 -1.6%, but s32/vs32 +1.5%) a late copy of tid: the q / new-row / table math below cannot be hoisted above the page-index
+  if (OKC_LATETID && !WS && (MODE & 8)) {   // (speculative builds only) a late copy of tid: the q / new-row / table math below cannot be hoisted above the page-index
     // copies (or out of the speculative retry loop to the kernel top: scout's v200 census, segment head 21 -> 62/97)
     asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tidL));
     partL = tidL & 7;
@@ -2260,7 +1710,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   if constexpr (!WS) {
     constexpr int PRE = Cfg<L, FLAT>::S2 ? STAGES - 2 : STAGES - 1;   // two streams: one cp.async group per tile, the loop issues pairs
     bool one = false;
-#if OKC_ONETILE && OKC_OFF32 && !OKC_TMA
     // OKC_ONETILE: a CTA with a single fully cached tile (page size 1, caches < 4 GB): its copies straight-line (one
     // shift-add per row), none of the loop / per-row tests / issue_idx past the last tile, then the commits the
     // pipeline's group count expects (scout's census: ~168 instr, 11 taken branches here on s1, cold)
@@ -2295,13 +1744,8 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
       for (int k = 0; k < STAGES - 1; ++k) cp_commit();
     }
-#endif
     if (!one) {
-#if OKC_PREUNR
 #pragma unroll
-#else
-#pragma unroll 1
-#endif
     for (int k = 0; k < STAGES - 1; ++k) {   // (unrolled: no loop branches; rolled: one copy of the issue code)
       if (k < PRE && k < ntiles) issue_kv(k, false);
       issue_idx(k + STAGES - 1);
@@ -2322,7 +1766,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       const int j = e >> 5, i = e & 31;
       const float ang = (float)(seq + j) * S.ifreq[i];   // fp32 angle, as the reference builds it
       float sv, cv;
-#if OKC_FASTSC
       // Cody-Waite reduction mod 2 pi with a 3-part constant (6.25 has 5 significant bits: exact products for
       // |k| < 2^19, angles up to ~3e6), then the hardware sin / cos on [-pi, pi]: ~5e-7 absolute, against
       // ~30 cold instructions (and a Payne-Hanek call above |x| ~ 1e5) for the accurate sincosf
@@ -2331,9 +1774,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       rr = fmaf(-kq, 0.03318530693650246f, rr);
       rr = fmaf(-kq, 2.430837753308879e-10f, rr);
       __sincosf(rr, &sv, &cv);
-#else
-      sincosf(ang, &sv, &cv);
-#endif
       S.cs[e] = cv;
       S.sn[e] = sv;
     });
@@ -2391,11 +1831,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
                      e4m3x4f(x[8], x[9], x[10], x[11]), e4m3x4f(x[12], x[13], x[14], x[15]));
     }
   } else
-#if OKC_QROLL
-#pragma unroll 1   // one copy of the pass (it runs once per launch from a cold instruction cache)
-#else
 #pragma unroll
-#endif
   for (int ps = 0; ps < QPASS; ++ps) {
     const int rr = ps * RPP + (tidL >> 3);
     const int j = rr >> 4, hh = rr & 15;
@@ -2581,9 +2017,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       if (i == 0) DBG(12);
     } else {
       cp_wait<STAGES - 2>();
-#if OKC_TMA
-      if (p.tma) mbar_wait(&S.mbar[i % STAGES], (i / STAGES) & 1);
-#endif
       __syncthreads();
       PROF_MARK(0);
       if (i == 0) DBG(12);
@@ -2593,10 +2026,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       PROF_MARK(1);
     }
 
-#if OKC_NOCOMPUTE
-    if constexpr (WS) { __syncwarp(); if (lane == 0) mbar_arrive(&S.empty[(tb + i) % STAGES]); }
-    continue;
-#endif
     const uint8_t* K = S.k + ((tb + i) % STAGES) * STAGE_BYTES;
     const uint8_t* V = S.v + ((tb + i) % STAGES) * STAGE_BYTES;
     const int t0 = start + i * TILE;
@@ -2633,34 +2062,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     float mx = -INFINITY;
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt) mx = fmaxf(mx, fmaxf(s[nt][0], s[nt][1]));
-#if OKC_LAZY1
-    // lazy offset (log2 units, in m_r): P = 2^(s - m_r) <= 2^8 in f16; the offset moves (with a rescale of o and l)
-    // only when a score passes it by 8 or on the first tile with keys. The check needs no row reduction: any such
-    // score shows in its own thread's partial max (warp-uniform vote, then quad shuffles only when needed).
-    if (__any_sync(0xffffffffu, (m_r[0] == -INFINITY) || (mx > m_r[0] + 8.f))) {
-      const float mq = quad_max(mx);
-      const float nd = (m_r[0] == -INFINITY) ? mq : fmaxf(mq, m_r[0]);
-      if (m_r[0] != -INFINITY && nd != m_r[0]) {
-        const float alpha = ex2(m_r[0] - nd);
-        l_r[0] *= alpha;
-#pragma unroll
-        for (int t = 0; t < 8; ++t) { o[0][t][0] *= alpha; o[0][t][1] *= alpha; }
-      }
-      m_r[0] = nd;
-    }
-    const float m_new = m_r[0];
-    if (m_new != -INFINITY) {
-      float ls = 0.f;
-#pragma unroll
-      for (int nt = 0; nt < 4; ++nt)
-#pragma unroll
-        for (int e = 0; e < 2; ++e) {
-          const float pv = ex2(s[nt][e] - m_new);
-          s[nt][e] = pv;
-          ls += pv;
-        }
-      l_r[0] += ls;
-#else
     mx = quad_max(mx);
     const float m_new = fmaxf(m_r[0], mx);
     if (m_new != -INFINITY) {
@@ -2682,7 +2083,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
         for (int t = 0; t < 8; ++t) { o[0][t][0] *= alpha; o[0][t][1] *= alpha; }
       }
-#endif
 #pragma unroll
       for (int ks = 0; ks < (OKC_XHALFPV ? 1 : 2); ++ks) {   // (OKC_XHALFPV: timing probe only, wrong results)
         uint32_t b0[8], b1[8];
@@ -2700,17 +2100,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     PROF_MARK(3);
     PROF_TILE;
     if (i == 0) DBG(13);
-#if OKC_SEGDBG
-    if (p.dbg && tid == 0 && (i & 15) == 15) {   // progress marks: time and (request, key) every 16 tiles
-      const int cta = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
-      const int n = S.dbgn;
-      if (n < 16) {
-        p.dbg[cta * DBGSTRIDE + 32 + n] = gtime();
-        p.dbg[cta * DBGSTRIDE + 48 + n] = (long long)b * 1000000 + start + (i + 1) * TILE;
-        S.dbgn = n + 1;
-      }
-    }
-#endif
   }
   PROF_DUMP;
   pdl_launch_dependents();
@@ -2809,17 +2198,12 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
                          !(OKC_TURN && WS && PV8 && !S2 && !F2 && !OKC_PROF) && !OKC_XP_NOFENCE;
   int st_c = tb % STAGES;
   uint32_t ph_c = (uint32_t)(tb / STAGES) & 1u;
-#if OKC_DSHFL
   // descriptor low words broadcast from lane 0: a shuffle result is uniform and is not rematerialized, so the
   // bases stay in uniform registers (the high words are constants); +st*512 / +2 never carry out of the low word
   const uint32_t qlo0 = __shfl_sync(0xffffffffu, (uint32_t)((smem_u32(S.q8s) + hk * 4096) >> 4) | 0x10000u, 0);
   const uint32_t klo0 = __shfl_sync(0xffffffffu, (uint32_t)((smem_u32(S.k) + hk * 64) >> 4) | 0x10000u, 0);
   const uint64_t qdesc0 = ((uint64_t)((512 >> 4) | (2u << 30)) << 32) | qlo0;
   const uint64_t kdesc0 = ((uint64_t)((1024 >> 4) | (1u << 30)) << 32) | klo0;
-#else
-  const uint64_t qdesc0 = desc_sw64(smem_u32(S.q8s) + hk * 4096);
-  const uint64_t kdesc0 = desc_sw128(smem_u32(S.k) + hk * 64);
-#endif
   const uint32_t vsrc0 = smem_u32(S.v);
   uint8_t* vtb_c = S.kvq + hk * 4608;
   const uintptr_t vtb_x = (uintptr_t)(S.kvq + hk * 4608) ^ (uintptr_t)(S.kvq + (2 + hk) * 4608);
@@ -2925,9 +2309,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       if (i >= ntiles) continue;   // odd tile count: the second stream sits out the last pair
     } else {
       if constexpr (!OKC_XNOWAIT) cp_wait<STAGES - 2>();   // (OKC_XNOWAIT: timing probe only, wrong results)
-#if OKC_TMA
-      if (p.tma) mbar_wait(&S.mbar[i % STAGES], (i / STAGES) & 1);
-#endif
       __syncthreads();       // tile i landed; previous tile's PV done (V16 free)
       PROF_MARK(0);
       if (i == 0) DBG(12);
@@ -2954,7 +2335,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     float s[32];
     wgmma_fence();
     if constexpr (PV8 && OKC_QSS && ADDR) {
-#if OKC_DSHFL
       const uint32_t kl = klo0 + (uint32_t)(st * (STAGE_BYTES >> 4));
       const uint64_t kd = ((uint64_t)((1024 >> 4) | (1u << 30)) << 32) | kl;
       const uint64_t kd2 = ((uint64_t)((1024 >> 4) | (1u << 30)) << 32) | (kl + 2u);
@@ -2962,12 +2342,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       if constexpr (OKC_QKZ) wgmma_m64n64k32_e4m3_ss_z(s, qdesc0, kd);
       else wgmma_m64n64k32_e4m3_ss(s, qdesc0, kd, 0);
       wgmma_m64n64k32_e4m3_ss(s, qd2, kd2, 1);
-#else
-      const uint64_t kd = kdesc0 + (uint64_t)(st * (STAGE_BYTES >> 4));
-      if constexpr (OKC_QKZ) wgmma_m64n64k32_e4m3_ss_z(s, qdesc0, kd);
-      else wgmma_m64n64k32_e4m3_ss(s, qdesc0, kd, 0);
-      wgmma_m64n64k32_e4m3_ss(s, qdesc0 + 2, kd + 2, 1);
-#endif
     } else if constexpr (PV8 && OKC_QSS) {
       const uint32_t qaddr = smem_u32(S.q8s) + hk * 4096;
       if constexpr (OKC_QKZ) wgmma_m64n64k32_e4m3_ss_z(s, desc_sw64(qaddr), desc_sw128(kaddr));
@@ -3084,21 +2458,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
           for (int e = 0; e < 2; ++e) {
             const int pos = t0 + 8 * nt + 2 * tig + e;
-#if OKC_XP_MASKRO   // compile experiment only: read the scores instead of writing them
-            if (pos < vlo || pos > vhi) asm volatile("" ::"f"(s[4 * nt + 2 * hf + e]));
-#else
             if (pos < vlo || pos > vhi) s[4 * nt + 2 * hf + e] = -INFINITY;
-#endif
           }
       }
     }
-#if OKC_PROF && OKC_PROFDEP
-    {   // diagnostic: when do the QK results actually arrive?
-      float t = __shfl_sync(0xffffffffu, fmaxf(s[0], s[31]), 0);
-      asm volatile("" ::"f"(t) : "memory");
-      PROF_MARK(3);
-    }
-#endif
     // OKC_PCHK: after a segment's first tile the offset test runs on the packed P instead of on 32 row-max steps: an
     // e4m3 byte above 0x78 (P > 256, i.e. a score past the offset + 8) sets bit 7 when 0x07 is added to every byte
     // (P >= 0: no carry between bytes); the (rare) hit moves the offset and repacks that half (see the PV loop)
@@ -3112,17 +2475,12 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       mhi = fmaxf(mhi, fmaxf(s[4 * nt + 2], s[4 * nt + 3]));
     }
     }
-#if OKC_LAZYMAX
     // the threshold check needs no row reduction: any element past the offset + 8 shows in its own thread's
     // partial max; only the (rare) offset move and the first tile reduce over the row's quad
     if (!OKC_RAWTHR && !chk) {
       mlo *= ssc;   // scores -> log2 units (ssc > 0; ssc = 1 when the query was pre-scaled)
       mhi *= ssc;
     }
-#else
-    mlo = quad_max(mlo) * ssc;   // scores -> log2 units (ssc = 1 when the query was pre-scaled)
-    mhi = quad_max(mhi) * ssc;
-#endif
     float dlo, dhi;
     if (first) {
       if (OKC_LAZYMAX) { mlo = quad_max(mlo); mhi = quad_max(mhi); }
@@ -3142,11 +2500,9 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         const float nlo = fmaxf(mlo, cr[0]), nhi = fmaxf(mhi, cr[1]);
         const float alo = ex2(cr[0] - nlo), ahi = ex2(cr[1] - nhi);
         // (the previous tile's PV wgmma completed at this tile's wgmma wait)
-#if !OKC_XP_NORESC
 #pragma unroll
         for (int t = 0; t < 8; ++t) { o[0][t][0] *= alo; o[0][t][1] *= alo; o[0][t][2] *= ahi; o[0][t][3] *= ahi; }
         lacc[0] *= alo; lacc[1] *= alo; lacc[2] *= ahi; lacc[3] *= ahi;   // (FP8 PV: the row sums live here too)
-#endif
         cr[0] = nlo; cr[1] = nhi;
         dlo = nlo; dhi = nhi;
         if (OKC_RAWTHR) { thr[0] = (nlo + 8.f) * rssc; thr[1] = (nhi + 8.f) * rssc; }
@@ -3157,42 +2513,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     if constexpr (TURN && OKC_TURN == 2) {   // (2: one offset only: head 1's first exponentials after head 0's)
       if (hk == 1 && jj == 0) bar_sync_n(6, 256);
     }
-#if OKC_PROF && !OKC_PROFPV8
-    // diagnostic split: all exponentials first (p5), then the MMAs (p6)
-    {
-      uint32_t pa[4][4];
-#pragma unroll
-      for (int ks = 0; ks < 4; ++ks) {
-        pa[ks][0] = ex2h2(fmaf(s[8 * ks], ssc, -dlo), fmaf(s[8 * ks + 1], ssc, -dlo));
-        pa[ks][1] = ex2h2(fmaf(s[8 * ks + 2], ssc, -dhi), fmaf(s[8 * ks + 3], ssc, -dhi));
-        pa[ks][2] = ex2h2(fmaf(s[8 * ks + 4], ssc, -dlo), fmaf(s[8 * ks + 5], ssc, -dlo));
-        pa[ks][3] = ex2h2(fmaf(s[8 * ks + 6], ssc, -dhi), fmaf(s[8 * ks + 7], ssc, -dhi));
-      }
-#pragma unroll
-      for (int ks = 0; ks < 4; ++ks)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) asm volatile("" : "+r"(pa[ks][e]));
-      PROF_MARK(5);
-#pragma unroll
-      for (int ks = 0; ks < 4; ++ks) {
-        const int mi = lane >> 3;
-        const int key = 16 * ks + (mi & 1) * 8 + (lane & 7);
-#pragma unroll
-        for (int dp = 0; dp < 4; ++dp) {
-          uint32_t b0a, b1a, b0b, b1b;
-          ldsm_x4_t(v16b + key * 128 + (((2 * dp + (mi >> 1)) ^ (key & 7)) << 4), b0a, b1a, b0b, b1b);
-          mma_f16(o[0][2 * dp], pa[ks][0], pa[ks][1], pa[ks][2], pa[ks][3], b0a, b1a);
-          mma_f16(o[0][2 * dp + 1], pa[ks][0], pa[ks][1], pa[ks][2], pa[ks][3], b0b, b1b);
-        }
-        mma_f16(lacc, pa[ks][0], pa[ks][1], pa[ks][2], pa[ks][3], ONES, ONES);
-      }
-#pragma unroll
-      for (int t = 0; t < 8; ++t)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) asm volatile("" : "+f"(o[0][t][e]));
-      PROF_MARK(6);
-    }
-#else
     if constexpr (PV8) {   // P (e4m3, registers, k-steps of 32 permuted keys) x V^T (e4m3, K-major, 72 columns: 64 dims + 8 copies of
         // the row sum) as an asynchronous wgmma; the next tile's wgmma wait covers it before P, o or V^T are reused
       constexpr bool PK2 = OKC_PK2 && PCHK && PVSPLIT && OKC_PVSPLIT == 1 && !OKC_EXH8 && !OKC_XP_NOEXP && OKC_EXPPOLY == 0 &&
@@ -3259,22 +2579,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
       for (int kk = 0; kk < (PK2 ? 0 : 2); ++kk) {
         const float* sv = s + 16 * kk;
-#if OKC_EXH8
-        pa[kk][0] = ex2_e4m3x4_h(fmaf(sv[0], ssc, -dlo), fmaf(sv[1], ssc, -dlo), fmaf(sv[4], ssc, -dlo), fmaf(sv[5], ssc, -dlo));
-        pa[kk][1] = ex2_e4m3x4_h(fmaf(sv[2], ssc, -dhi), fmaf(sv[3], ssc, -dhi), fmaf(sv[6], ssc, -dhi), fmaf(sv[7], ssc, -dhi));
-        pa[kk][2] = ex2_e4m3x4_h(fmaf(sv[8], ssc, -dlo), fmaf(sv[9], ssc, -dlo), fmaf(sv[12], ssc, -dlo), fmaf(sv[13], ssc, -dlo));
-        pa[kk][3] = ex2_e4m3x4_h(fmaf(sv[10], ssc, -dhi), fmaf(sv[11], ssc, -dhi), fmaf(sv[14], ssc, -dhi), fmaf(sv[15], ssc, -dhi));
-        continue;
-#endif
-#if OKC_XP_NOEXP
-#define ex2(x) (x)
-#endif
-#if OKC_EXPPOLY > 0
-        // OKC_EXPPOLY of every 4 exponentials on the FMA pipe (positions 0..k-1 of each e4m3x4 group)
-#define EXQ(x, q) ((q) < OKC_EXPPOLY ? ex2_poly(x) : ex2(x))
-#else
 #define EXQ(x, q) ex2(x)
-#endif
         bool rchk = chk;   // one retry at most: after the offset move every finite P is <= 1 (NaN / garbage scores
                            // would otherwise retrigger the check forever: the SASS oracle's value-perturbing probe hung)
 #pragma unroll 1
@@ -3319,9 +2624,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         }
         }   // (pack / check loop)
 #undef EXQ
-#if OKC_XP_NOEXP
-#undef ex2
-#endif
         if constexpr (PVSPLIT) {   // each half of P goes to the tensor cores as soon as it is packed
           float* od = &o[0][0][0];
           if constexpr (LSYNCN) {   // every warp's V^T for this tile written (and visible to the async proxy)
@@ -3388,30 +2690,6 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       }
       }   // (!PVSPLIT)
     } else {
-#if OKC_PVW
-    {   // P (registers) x V16 (shared, MN-major) as an asynchronous wgmma: it completes while the next tile's
-        // QK^T and V conversion run (the wgmma wait there covers it before P, o or this V16 buffer are reused)
-      uint32_t pa[4][4];
-#pragma unroll
-      for (int ks = 0; ks < 4; ++ks) {
-        pa[ks][0] = ex2h2(fmaf(s[8 * ks], ssc, -dlo), fmaf(s[8 * ks + 1], ssc, -dlo));
-        pa[ks][1] = ex2h2(fmaf(s[8 * ks + 2], ssc, -dhi), fmaf(s[8 * ks + 3], ssc, -dhi));
-        pa[ks][2] = ex2h2(fmaf(s[8 * ks + 4], ssc, -dlo), fmaf(s[8 * ks + 5], ssc, -dlo));
-        pa[ks][3] = ex2h2(fmaf(s[8 * ks + 6], ssc, -dhi), fmaf(s[8 * ks + 7], ssc, -dhi));
-      }
-      float* od = &o[0][0][0];
-#pragma unroll
-      for (int e = 0; e < 32; ++e) reg_fence(od[e]);
-      wgmma_fence();
-#pragma unroll
-      for (int ks = 0; ks < 4; ++ks)
-        wgmma_m64n64k16_f16_tb(od, pa[ks][0], pa[ks][1], pa[ks][2], pa[ks][3], desc_sw128(v16b + ks * 2048));
-      wgmma_commit();
-#pragma unroll
-      for (int ks = 0; ks < 4; ++ks) mma_f16(lacc, pa[ks][0], pa[ks][1], pa[ks][2], pa[ks][3], ONES, ONES);
-    }
-    PROF_MARK(5);
-#else
 #pragma unroll
     for (int ks = 0; ks < 4; ++ks) {
       const uint32_t a0 = ex2h2(fmaf(s[8 * ks], ssc, -dlo), fmaf(s[8 * ks + 1], ssc, -dlo));
@@ -3429,24 +2707,14 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       }
       mma_f16(lacc, a0, a1, a2, a3, ONES, ONES);
     }
-#endif
     }
     PROF_MARK(5);
-#endif
     PROF_TILE;
     if (i == 0) DBG(13);
     if constexpr (F2) {
       i_cur = S.nxt[wgi][(cnt2 + 1) & 1];   // written before this tile's warpgroup barrier
       ++cnt2;
     }
-#if OKC_YIELD > 0
-    // flat grids, two CTAs per SM: the first-dispatched CTA (lower half of the grid) wins the warp schedulers and
-    // the other one runs mostly after it (measured slow/fast 1.3 on every SM); its consumers yield a little per
-    // tile so both finish together
-    if constexpr (FLAT && WS) {
-      if (blockIdx.x * 2 < gridDim.x) __nanosleep(OKC_YIELD);
-    }
-#endif
     if constexpr (ADDR) {
       if (++st_c == STAGES) { st_c = 0; ph_c ^= 1u; }
       vtb_c = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(vtb_c) ^ vtb_x);
@@ -3819,11 +3087,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         SPIN_T0;
         for (;;) {
           asm volatile("ld.acquire.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(c) : "memory");
-#ifdef OKC_SPINTEST
-          if (v >= n_keys + 1) break;   // (test builds: an unreachable target -> the spin guard must trap)
-#else
           if (v >= n_keys) break;
-#endif
           SPIN_CHECK;
           __nanosleep(64);
         }
@@ -3848,12 +3112,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     DBG(4);
     const int r_lo = split_idx * R, r_hi = min(L * 16, r_lo + R);
     const int part = tid & 7;
-#if OKC_FIN1
-#pragma unroll 1
     for (int rbase = r_lo; rbase < r_hi; rbase += NT / 8) {   // warp-uniform trip count (shuffles below)
-#else
-    for (int rbase = r_lo; rbase < r_hi; rbase += NT / 8) {   // warp-uniform trip count (shuffles below)
-#endif
       const int rr = rbase + (tid >> 3);
       const bool act = rr < r_hi;
       const int j = act ? rr >> 4 : 0, hh = act ? rr & 15 : 0;
@@ -4083,13 +3342,6 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
   Smem<L, FLAT>& S = *reinterpret_cast<Smem<L, FLAT>*>(smem_raw + ((1024u - (smem_u32(smem_raw) & 1023u)) & 1023u));
   const int pair = blockIdx.z;
   DBG(0);
-#if OKC_SMDBG
-  if (p.dbg && threadIdx.x == 0) {
-    unsigned smid;
-    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-    p.dbg[(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * DBGSTRIDE + 15] = smid;
-  }
-#endif
   if (!FLAT) {
     // grid (n_splits, B): request b, split s of its window / context
     const int split = blockIdx.x, b = blockIdx.y;
@@ -4107,7 +3359,6 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
     const int n_keys = seq + L - lo;
     int chunk = fdiv_i(n_keys + p.n_splits - 1, p.n_splits);
     chunk = (chunk + 15) & ~15;
-#if OKC_TCHUNK
     // plain split-KV: whole tiles per split (the per-CTA tile count is what costs); trailing splits may get no keys:
     // they skip the workspace merge (the merge counts keys, the cooperative finalize counts the splits with keys).
     // Not for clusters (an empty cluster CTA still runs the cluster epilogue: measured slower)
@@ -4118,7 +3369,6 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
       if constexpr (OKC_MAGICDIV) chunk = (p.ns_magic ? (int)__umulhi((unsigned)ntl, p.ns_magic) : ntl) << 6;
       else chunk = fdiv_i(ntl, p.n_splits) << 6;
     }
-#endif
     int start = lo + split * chunk;
     int end = min(seq + L, start + chunk);
     // OKC_UNEV: splits beyond the SM count share an SM with an earlier split, which gets the warp schedulers'
@@ -4321,11 +3571,6 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
   constexpr int SEGK = (L == 8) ? OKC_SEGK8 : OKC_SEGK1;
   const int64_t T = T0 + (SEGK > 0 ? (int64_t)(p.B - 1) * SEGK : 0);
   const int c = blockIdx.x, G = gridDim.x;
-#if OKC_BALPART
-  // balanced shares with one 32-bit division (T < 2^31: at most 512 requests of ~1M keys)
-  const unsigned Tq = (unsigned)T / (unsigned)G, Tr = (unsigned)T - Tq * (unsigned)G;
-  int cs = (int)(c * Tq + min((unsigned)c, Tr)), ce = cs + (int)Tq + ((unsigned)c < Tr ? 1 : 0);
-#else
   // (OKC_SWAPHALF, experiment: the first-dispatched half of the grid takes the second half of the keys)
   const int cpart = (OKC_SWAPHALF && (G & 1) == 0) ? (c + (G >> 1)) % G : c;
   int cs, ce;
@@ -4337,7 +3582,6 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
     ce = (int)((int64_t)(cpart + 1) * T / G);
   }   // (a float-estimate + correction
   // version without the 64-bit division call measured slower: q_len 1 b16 full +3 us, likely code layout)
-#endif
   if (OKC_WSPLIT != 500 && (G & 1) == 0 && gridDim.y * gridDim.z == 1) {
     // CTAs c and c + G/2 are dispatched to the same SM, and the first one dispatched runs faster: give the first
     // half of the grid OKC_WSPLIT per mille of the keys
@@ -4466,12 +3710,6 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
         mbar_init_n(&S.full[st], Cfg<L, FLAT>::NP);
         mbar_init_n(&S.empty[st], OKC_XP_ARRALL ? Cfg<L, FLAT>::NT : Cfg<L, FLAT>::NT / 32);
       }
-#if OKC_DYN
-      for (int k = 0; k < 16; ++k) {
-        mbar_init_n(&S.dqf[k], 1);
-        mbar_init_n(&S.dqe[k], Cfg<L, FLAT>::NT / 32);
-      }
-#endif
       mbar_fence_init();
     }
   }
@@ -4490,18 +3728,6 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
   if (!fpart) __syncthreads();   // (OKC_FPART: warp 0 wrote the list before the barrier above)
   if (threadIdx.x == 0) FPRO_STAMP(41);
   const int nseg = S.nseg;
-#if OKC_SEGDBG
-  if (p.dbg && threadIdx.x == 0) p.dbg[(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * DBGSTRIDE + 7] = nseg;
-  if (threadIdx.x == 0) S.dbgn = 0;
-#endif
-#if OKC_SEGDBG
-  if (p.dbg && threadIdx.x == 0) {
-    unsigned smid;
-    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-    p.dbg[(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * DBGSTRIDE + 24] = smid;
-    p.dbg[(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * DBGSTRIDE + 25] = vc;
-  }
-#endif
   auto run_segments = [&](auto role) {
     constexpr int R = decltype(role)::value;
     int tb = 0;
@@ -4525,117 +3751,18 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
     }
     if constexpr (R == 1 && OKC_CONT) cp_wait<0>();   // the producer leaves with its copies landed
   };
-#if OKC_DYN
-  // Dynamic chunks (producer mode with a continuous pipeline): the concatenated keys are cut into G * OKC_DYNK
-  // equal chunks; CTA c starts with chunk c and claims further chunks from a global counter, so the CTA that
-  // runs faster (two share each SM, and they do not progress equally) takes more of them. The producer's first
-  // thread turns each chunk into segments and hands them to the consumers through a shared-memory queue.
-  auto run_dynamic = [&](auto role) {
-    constexpr int R = decltype(role)::value;
-    constexpr int QN = 16;
-    const int NCH = G * OKC_DYNK;
-    int tb = 0, qk = 0;
-    if constexpr (R == 1) {
-      const int q = threadIdx.x - Cfg<L, FLAT>::NT;
-      int c = blockIdx.x;
-#pragma unroll 1
-      for (;;) {
-        if (q == 0) {
-          int n = 0;
-          if (c < NCH) {
-            const int cs = (int)((int64_t)c * T / NCH), ce = (int)((int64_t)(c + 1) * T / NCH);
-            int lo_b = 0, hi_b = p.B - 1;   // first request with cum[b + 1] > cs
-            while (lo_b < hi_b) {
-              const int mid = (lo_b + hi_b) >> 1;
-              if (S.cum[mid + 1] <= cs) lo_b = mid + 1; else hi_b = mid;
-            }
-            for (int b = lo_b; b < p.B && S.cum[b] < ce && n < MAXSEG; ++b) {
-              S.pseg[n][0] = b;
-              S.pseg[n][1] = max(cs, S.cum[b]) - S.cum[b];
-              S.pseg[n][2] = min(ce, S.cum[b + 1]) - S.cum[b];
-              ++n;
-            }
-          }
-          S.pnseg = n;
-          S.pchunk = c;
-          for (int k = 0; k < n + (c < NCH ? 0 : 1); ++k) {   // the segments, or the end marker
-            const int slot = qk % QN;
-            if (qk >= QN) mbar_wait_full(&S.dqe[slot], ((qk / QN) - 1) & 1);
-            if (c < NCH) {
-              S.dq[slot][0] = S.pseg[k][0];
-              S.dq[slot][1] = S.pseg[k][1];
-              S.dq[slot][2] = S.pseg[k][2];
-              S.dq[slot][3] = c;
-            } else {
-              S.dq[slot][0] = -1;
-            }
-            mbar_arrive(&S.dqf[slot]);
-            ++qk;
-          }
-        }
-        asm volatile("bar.sync 2, %0;\n" ::"n"(Cfg<L, FLAT>::NP) : "memory");
-        const int n = S.pnseg, cc = S.pchunk;
-        if (cc >= NCH) break;
-#pragma unroll 1
-        for (int k = 0; k < n; ++k) {
-          const int b = S.pseg[k][0];
-          const int seq = __ldg(p.seq_lens + b);
-          const int lo = p.window ? max(0, seq + 1 - p.window) : 0;
-          const int s0 = S.pseg[k][1] + lo, s1 = S.pseg[k][2] + lo;
-          if (s0 < s1) {
-            segment<L, FLAT, 1>(p, S, b, pair, s0 == lo, s0, s1, seq, seq + L - lo, cc - fdiv_i(cc, p.nc) * p.nc, 0, tb);
-            tb += (s1 - s0 + TILE - 1) / TILE;
-          }
-        }
-        if (q == 0) {   // every copy of this chunk is issued: claim the next one
-          const int old = atomicAdd(p.ws_cnt + 30010 + pair, 1);   // one counter per KV pair (grid z)
-          if (old == NCH - 1) p.ws_cnt[30010 + pair] = 0;   // the launch's last claim resets the counter
-          c = G + old;
-        }
-        asm volatile("bar.sync 2, %0;\n" ::"n"(Cfg<L, FLAT>::NP) : "memory");   // pseg is rewritten next
-      }
-      cp_wait<0>();
-    } else {
-#pragma unroll 1
-      for (;;) {
-        const int slot = qk % QN;
-        mbar_wait_full(&S.dqf[slot], (qk / QN) & 1);
-        const int b = S.dq[slot][0], r0 = S.dq[slot][1], r1 = S.dq[slot][2], cc = S.dq[slot][3];
-        __syncwarp();
-        if ((threadIdx.x & 31) == 0) mbar_arrive(&S.dqe[slot]);
-        ++qk;
-        if (b < 0) break;
-        const int seq = __ldg(p.seq_lens + b);
-        const int lo = p.window ? max(0, seq + 1 - p.window) : 0;
-        const int s0 = r0 + lo, s1 = r1 + lo;
-        if (s0 < s1) {
-          segment<L, FLAT, R>(p, S, b, pair, s0 == lo, s0, s1, seq, seq + L - lo, cc - fdiv_i(cc, p.nc) * p.nc, 0, tb);
-          tb += (s1 - s0 + TILE - 1) / TILE;
-        }
-      }
-    }
-  };
-#endif
   if constexpr (Cfg<L, FLAT>::WS) {
     // separate code for the two roles, so the producer warpgroup can hand its registers to the consumers
     if (threadIdx.x >= Cfg<L, FLAT>::NT) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
       if constexpr (OKC_SETMAXNREG) asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(Cfg<L, FLAT>::PREGS));
 #endif
-#if OKC_DYN
-      run_dynamic(std::integral_constant<int, 1>());
-#else
       run_segments(std::integral_constant<int, 1>());
-#endif
     } else {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
       if constexpr (OKC_SETMAXNREG) asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(Cfg<L, FLAT>::CREGS));
 #endif
-#if OKC_DYN
-      run_dynamic(std::integral_constant<int, 2>());
-#else
       run_segments(std::integral_constant<int, 2>());
-#endif
       if constexpr (L == 8 || OKC_FLATCOOP1C) {
         if (p.coop) flat_finalize<L, true, Cfg<L, FLAT>::NT>(p, &S.sense);
       }
@@ -4664,36 +3791,24 @@ void launch(const Params& p0, dim3 grid, cudaStream_t stream, int cs, bool clust
   // (slot 0, the run-time-mode build, only serves the sm_80 emulation of clusters: not built for sm_90)
   static const KernFn kn[4] = {attn_kernel<L, false, OKC_SM90 ? 2 : 0>, attn_kernel<L, false, 1>,
                                attn_kernel<L, false, 2>, attn_kernel<L, false, 3>};
-#if OKC_ONE
   static const KernFn kn1[4] = {nullptr, attn_kernel<L, false, 5>, nullptr, attn_kernel<L, false, 7>};
-#endif
-#if OKC_SPEC
   static const KernFn ksp[4] = {nullptr, attn_kernel<L, false, 9>, nullptr, attn_kernel<L, false, 11>};
   static const KernFn ksp1[4] = {nullptr, attn_kernel<L, false, 13>, nullptr, attn_kernel<L, false, 15>};
-#endif
   if (!init) {
     for (int m = 1; m < 4; ++m)
       cudaFuncSetAttribute(kn[m], cudaFuncAttributeMaxDynamicSharedMemorySize, (m == 2 && OKC_CLSM > sm_n) ? OKC_CLSM : sm_n);
-#if OKC_ONE
     cudaFuncSetAttribute(kn1[1], cudaFuncAttributeMaxDynamicSharedMemorySize, sm_n);
     cudaFuncSetAttribute(kn1[3], cudaFuncAttributeMaxDynamicSharedMemorySize, sm_n);
-#endif
-#if OKC_SPEC
     for (int m = 1; m < 4; m += 2) {
       cudaFuncSetAttribute(ksp[m], cudaFuncAttributeMaxDynamicSharedMemorySize, sm_n);
       cudaFuncSetAttribute(ksp1[m], cudaFuncAttributeMaxDynamicSharedMemorySize, sm_n);
     }
-#endif
     cudaFuncSetAttribute(attn_kernel<L, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm_f);
     if (clusters) cudaFuncSetAttribute(kn[2], cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_c, kn[3], Cfg<L, false>::NTX, sm_n);
-#if OKC_ONE
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_c1, kn1[3], Cfg<L, false>::NTX, sm_n);
-#endif
-#if OKC_SPEC
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_sp, ksp[3], Cfg<L, false>::NTX, sm_n);
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_sp1, ksp1[3], Cfg<L, false>::NTX, sm_n);
-#endif
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_f, attn_kernel<L, true>, Cfg<L, true>::NTX, sm_f);
     int dev;
     cudaGetDevice(&dev);
@@ -4708,7 +3823,6 @@ void launch(const Params& p0, dim3 grid, cudaStream_t stream, int cs, bool clust
             (int)grid.x <= 2 * nsm) ? nsm : 0;
   const bool cl = cs > 1 && clusters;
   KernFn kern = p.flat ? (KernFn)attn_kernel<L, true> : kn[cl ? 2 : (q.coop ? 3 : 1)];
-#if OKC_ONE
   if (!p.flat && !cl && !(OKC_UNEV && q.unev)) {
     // every split holds at most one tile: whole tiles per split (TCHUNK) and at least as many splits as the longest
     // request's tiles (sliding windows: window + L - 1 keys)
@@ -4716,28 +3830,18 @@ void launch(const Params& p0, dim3 grid, cudaStream_t stream, int cs, bool clust
                                     : (long long)p.max_pages * p.P;
     if (OKC_TCHUNK && (long long)p.n_splits * 64 >= kmax) kern = kn1[q.coop ? 3 : 1];
   }
-#endif
-#if OKC_SPEC
   // one request, page size 1: the speculative-length builds (OKC_SPEC; the kernel verifies and falls back)
   if (!p.flat && !cl && !(OKC_UNEV && q.unev) && p.B == 1 && p.P == 1 && p.max_pages >= L && (int)grid.y == 1) {
     const bool one = kern != kn[q.coop ? 3 : 1];
     kern = one ? ksp1[q.coop ? 3 : 1] : ksp[q.coop ? 3 : 1];
   }
-#endif
   if (OKC_COOPGUARD && q.coop && !p.flat && !cl) {
     // the instance actually launched must hold the whole grid, else its grid barrier would wait forever
     int occ_k = occ_c;
     KernFn plain = kn[1];
-#if OKC_ONE
     if (kern == kn1[3]) { occ_k = occ_c1; plain = kn1[1]; }
-#endif
-#if OKC_SPEC
     if (kern == ksp[3]) { occ_k = occ_sp; plain = ksp[1]; }
     if (kern == ksp1[3]) { occ_k = occ_sp1; plain = ksp1[1]; }
-#endif
-#ifdef OKC_COOPGUARD_TEST
-    occ_k = 0;   // (test builds: always take the fallback)
-#endif
     if ((long long)grid.x * grid.y * grid.z > (long long)occ_k * nsm) {
       q.coop = 0;
       kern = plain;
@@ -4788,29 +3892,9 @@ static EncodeTiledFn get_encode() {
   }
   return encode;
 }
-// the page table as one int32 vector, 64-entry boxes, zeros past the end
-static CUtensorMap pt_map(void* base, long long n) {
-  CUtensorMap m;
-  cuuint64_t dims[1] = {(cuuint64_t)n};
-  cuuint64_t strides[1] = {0};
-  cuuint32_t box[1] = {64};
-  cuuint32_t es[1] = {1};
-  const CUresult r = get_encode()(&m, CU_TENSOR_MAP_DATA_TYPE_INT32, 1, base, dims, strides, box, es,
-                                  CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                  CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled (page table) failed: ", (int)r);
-  return m;
-}
 // [rows, row_bytes] byte view of a cache, boxes of one 128-byte row (one KV pair), 128-byte swizzle
 static CUtensorMap row_map(void* base, long long rows, long long row_bytes) {
-  static EncodeTiledFn encode = nullptr;
-  if (!encode) {
-    void* fn = nullptr;
-    cudaDriverEntryPointQueryResult q;
-    cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &fn, cudaEnableDefault, &q);
-    TORCH_CHECK(fn != nullptr, "cuTensorMapEncodeTiled unavailable");
-    encode = reinterpret_cast<EncodeTiledFn>(fn);
-  }
+  const EncodeTiledFn encode = get_encode();
   CUtensorMap m;
   cuuint64_t dims[2] = {(cuuint64_t)row_bytes, (cuuint64_t)rows};
   cuuint64_t strides[1] = {(cuuint64_t)row_bytes};
@@ -4894,6 +3978,7 @@ void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, tor
 }
 """
 
+
 CPP_SRC = r"""
 void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, torch::Tensor k_cache,
          torch::Tensor v_cache, torch::Tensor page_table, torch::Tensor k_scale, torch::Tensor v_scale,
@@ -4904,15 +3989,51 @@ void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, tor
          int64_t tma);
 """
 
+
 _MOD = None
 _INV_FREQ = {}
 _WS = {}
 _NUM_SMS = {}
-LOG2E = 1.4426950408889634
+_CL = {}
+
+
+def _cached(cache, key, make):
+    """Memoized builder for device properties and small derived tensors."""
+    value = cache.get(key)
+    if value is None:
+        value = make()
+        cache[key] = value
+    return value
+
+
+# Per-shape launch overrides measured on the judge's H200:
+# (batch, q_len, sliding, kv pairs) -> plan fields.
+_TUNED = {
+    (32, 8, True, 1): dict(n_splits=4, nc=1, coop=1),
+    (1, 1, False, 1): dict(nc=8, coop=1, n_splits=252),
+}
+
+# ---- host-side tuning switches (mirror the CUDA OKC_* table where named) ----
+OKC_FLATCOOP = 1
+OKC_PDL = 0      # launch with programmatic dependent launch (for a fused layer: overlaps the qkv GEMM's tail)
+OKC_FLAT1B = 0   # q_len 1, one full-layer request: flat kernel
+OKC_PLAIN8 = 1   # q_len 8 sliding, >= 16 requests: plain split-KV, ~1 CTA per SM
+OKC_F2 = 0   # must match the CUDA macro OKC_F2 (q_len 8 flat: 1 CTA per SM, two streams)
+OKC_S2 = 0   # must match the CUDA macro OKC_S2 (q_len 8 per-request kernels: 2 streams, 1 CTA per SM)
+OKC_W0_L1 = 1024   # flat: first CTA's share on each SM, /1024 (1024 = even)
+OKC_W0_PR = 1024   # per-request coop grids, one request, more splits than SMs: first-wave tile weight /1024
+OKC_W0_L8 = 1135   # q_len 8 flat: the lower-blockIdx CTA of each SM takes 1135/2048
+W0_EVEN = 1024     # w0: the even split
 
 
 def _build(tag="", flags=()):
+    # The CUDA tuning table is a closed world: only OKC_SM90 is set from the
+    # outside. A -DOKC_* flag here would silently diverge from that table.
+    for flag in flags:
+        if flag.startswith("-DOKC_"):
+            raise ValueError(f"OKC tuning switches are fixed in this file; refusing {flag}")
     from torch.utils.cpp_extension import load_inline
+
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
     return load_inline(
@@ -4933,25 +4054,26 @@ def _module():
     return _MOD
 
 
-def _inv_freq(theta, device):
-    key = (float(theta), str(device))
-    t = _INV_FREQ.get(key)
-    if t is None:
+def _inv_freq(theta, device, n_pairs=HEAD_DIM // 2):
+    """RoPE inverse frequencies, 1 / theta^(2i / head_dim), one per pair."""
+
+    def make():
         if theta:
-            t = 1.0 / (theta ** (torch.arange(0, 64, 2, device=device).float() / 64))
+            t = 1.0 / (theta ** (torch.arange(0, 2 * n_pairs, 2, device=device).float() / (2 * n_pairs)))
         else:
-            t = torch.zeros(32, device=device)
-        _INV_FREQ[key] = t.float().contiguous()
-    return t
+            t = torch.zeros(n_pairs, device=device)
+        return t.float().contiguous()
+
+    return _cached(_INV_FREQ, (float(theta), str(device), n_pairs), make)
 
 
 def _workspace(n_rows, device):
     """Persistent FP32 accumulators (zero between calls: the last CTA resets them)."""
     key = str(device)
     ws = _WS.get(key)
-    if ws is None or ws[0].numel() < n_rows * 64:
-        n = max(n_rows, 1 << 15)
-        ws = (torch.zeros(n * 64, dtype=torch.float32, device=device),
+    if ws is None or ws[0].numel() < n_rows * HEAD_DIM:
+        n = max(n_rows, WORKSPACE_MIN_ROWS)
+        ws = (torch.zeros(n * HEAD_DIM, dtype=torch.float32, device=device),
               torch.zeros(n, dtype=torch.float32, device=device),
               torch.zeros(n, dtype=torch.int32, device=device))
         _WS[key] = ws
@@ -4959,32 +4081,22 @@ def _workspace(n_rows, device):
 
 
 def _num_sms(device):
-    key = str(device)
-    if key not in _NUM_SMS:
-        _NUM_SMS[key] = torch.cuda.get_device_properties(device).multi_processor_count
-    return _NUM_SMS[key]
+    return _cached(_NUM_SMS, str(device), lambda: torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-# per-shape launch overrides measured on the judge's H200: (batch, q_len, sliding, kv pairs) -> plan fields
-_TUNED = {
-    # (Oct 26 14:16-14:21, podbench_multi 15 rounds x2: b32 q8 sliding at 4 splits per request -- 128 CTAs, one per SM --
-    # 16.10 -> 15.50 us; 3 splits +13%, 5 +10.6%, 6 +3.1%: since the faster per-request q8 loop (LATESYNCN, QKFIRST))
-    (32, 8, True, 1): dict(n_splits=4, nc=1, coop=1),
-    # (Oct 26 14:44-14:48: b1 q1 full with the cooperative finalize over 8 copies: GPU-1 plan sweep -1.6%, podbench_multi
-    # 12 rounds 12.30 -> 12.00 us; coop with 1/2/4 copies +26/+16/+4%: same-address red serialization of 250 splits)
-    (1, 1, False, 1): dict(nc=8, coop=1, n_splits=252),   # (experiment: 252 instead of 264 splits)
-}
+def _splits(tiles, quota):
+    """Splits per (request, KV pair): at least 1, at most one per tile."""
+    return max(1, min(tiles, quota))
 
 
-OKC_FLATCOOP = 1
-OKC_PDL = 0      # launch with programmatic dependent launch (for a fused layer: overlaps the qkv GEMM's tail)
-OKC_FLAT1B = 0   # q_len 1, one full-layer request: flat kernel (Oct 26 00:14: the per-request coop plan, 264 splits, 4 copies, is now faster: f1 13.2 -> 12.6 us)
-OKC_PLAIN8 = 1   # q_len 8 sliding, >= 16 requests: plain split-KV, ~1 CTA per SM
-OKC_F2 = 0   # must match the CUDA macro OKC_F2 (q_len 8 flat: 1 CTA per SM, two streams)
-OKC_S2 = 0   # must match the CUDA macro OKC_S2 (q_len 8 per-request kernels: 2 streams, 1 CTA per SM)
-OKC_W0_L1 = 1024   # flat: first CTA's share on each SM, /1024 (uneven shares measured slower: the faster CTA is not always the first)
-OKC_W0_PR = 1024   # per-request coop grids, one request, more splits than SMs: first-wave tile weight /1024
-OKC_W0_L8 = 1135   # q_len 8 flat: the lower-blockIdx CTA of each SM takes 1135/2048 (Oct 25 re-sweeps: bottom 1130-1140; 1180 overloads it)
+def _copies(n, cap):
+    """Workspace copies: at least 1, at most cap."""
+    return max(1, min(n, cap))
+
+
+def _headroom(target):
+    """The per-request grids run slightly below the CTA target."""
+    return (target * PLAN_HEADROOM_NUM) // PLAN_HEADROOM_DEN
 
 
 def _plan(B, pairs, L, window, max_pages, P, device):
@@ -4992,84 +4104,67 @@ def _plan(B, pairs, L, window, max_pages, P, device):
     requests; clusters of cs CTAs reduce through DSMEM (ncl clusters per request); nc workspace copies."""
     sms = _num_sms(device)
     target = 2 * sms
-    if not window and 1 < B <= 512:
-        # full layer, several requests: equal shares of all requests' keys, one CTA pass per SM pair;
-        # several workspace copies spread the end-of-run atomics (H200: b32 L1 206 us with 8 vs 237 with 1)
+    if not window and 1 < B <= MAX_BATCH:
+        # Full layer, several requests: equal shares of all requests' keys, one CTA pass per SM pair.
         ft = sms if (L == 8 and OKC_F2 and torch.cuda.get_device_capability(device)[0] >= 9) else target
-        # one workspace copy since the 16-byte merge atomics and the parity barriers (v101: q_len 1 b16 91.4 -> 90.0,
-        # b32 167.7 -> 166.1 with 264 CTAs; q_len 8 b32 199.6 -> 198.0); single requests keep their copies (contention)
         return dict(n_splits=max(1, ft // pairs), flat=1, cs=0, ncl=1, nc=1)
     keys_max = min(window + L - 1, max_pages * P) if window else max_pages * P
-    tiles = max(1, (keys_max + 63) // 64)
+    tiles = max(1, (keys_max + TILE_KEYS - 1) // TILE_KEYS)
     reqs = B * pairs
     if L == 8 and OKC_S2 and torch.cuda.get_device_capability(device)[0] >= 9:
         target = sms   # two tile streams per CTA, one CTA per SM (the kernel's OKC_S2)
     if not window:
         if L == 1 and B == 1 and OKC_FLAT1B:
-            # one long request, q_len 1: the flat kernel (producer warps) over 2 CTAs per SM (H200: 14.4 -> 13.9 us)
-            return dict(n_splits=max(1, ((target * 21) // 22) // pairs), flat=1, cs=0, ncl=1, nc=4)
-        # one long request: plain split-KV over 2 CTAs per SM (clusters measured slower here); q_len 8: 252 CTAs
-        # and 8 workspace copies (H200 b1: 20.7 -> 19.75 us vs 264 and 4)
+            # One long request, q_len 1: the flat kernel (producer warps) over 2 CTAs per SM.
+            return dict(n_splits=max(1, _headroom(target) // pairs), flat=1, cs=0, ncl=1, nc=4)
+        # One long request: plain split-KV over 2 CTAs per SM (clusters slower here).
         if L == 8:
-            n = max(1, min(tiles, ((target * 21) // 22) // reqs))
-            return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=max(1, min(n, 8)))
-        n = max(1, min(tiles, target // reqs))
-        # (q_len 1: the last CTA finalizes, over 4 workspace copies -- Oct 26 00:26, f1 per-request: coop 13.0-13.1 us,
-        # last-CTA 12.6-12.9, one copy 15.2, two 14.0, eight 12.9-13.2; the flat kernel 13.6)
-        return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=max(1, min(n, 4)), coop=0)
+            n = _splits(tiles, _headroom(target) // reqs)
+            return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=_copies(n, 8))
+        n = _splits(tiles, target // reqs)
+        return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=_copies(n, 4), coop=0)
     if L == 1 and reqs < 24:
-        # judge timings: plain split-KV with one tile per CTA and a single workspace copy beats clusters here
-        # (Oct 25 21:36, after the cheaper merges: b1 33 splits (one tile each) 6.6 -> 6.5 us vs 32, b16 16 splits
-        # 9.4 -> 9.2 us vs 12)
-        n = max(1, min(tiles, target // reqs))
+        # Few requests, sliding: plain split-KV with one tile per CTA and a single workspace copy.
+        n = _splits(tiles, target // reqs)
         return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=1)
     if L == 8 and reqs < 16 and OKC_PLAIN8:
-        # q_len 8, few requests: plain split-KV with one tile per CTA and the cooperative finalize (every CTA
-        # normalizes a slice of the 128 rows) beats clusters since the inlined finalizes (H200 b1: 13.0 -> 10.2 us)
-        n = max(1, min(tiles, target // reqs))
-        return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=1, coop=1)   # (one copy since v101: b1 9.8 -> 9.6 us)
+        # q_len 8, few requests: plain split-KV with one tile per CTA and the cooperative finalize
+        # (every CTA normalizes a slice of the rows) beats clusters.
+        n = _splits(tiles, target // reqs)
+        return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=1, coop=1)
     if L == 8 and reqs >= 16 and OKC_PLAIN8:
-        # q_len 8, many requests: plain split-KV with about one CTA per SM (H200 since the inlined last-CTA
-        # finalize: b16 19.0 -> 17.2 us vs clusters of 8, b32 22.0 -> 21.1 us vs two CTAs per SM); the cooperative
-        # finalize helps at 8 splits per request (b16 16.2 -> 15.85 us), and at 4 (b32) since the parity barriers
-        # (v102: 20.15 -> 19.55 us); b32: two CTAs per SM (8 splits) since v126 (19.4 -> 18.25 us)
-        n = max(1, min(tiles, (target if reqs >= 24 else sms) // reqs))
+        # q_len 8, many requests: plain split-KV with about one CTA per SM, plus the cooperative finalize.
+        n = _splits(tiles, (target if reqs >= 24 else sms) // reqs)
         return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=1, coop=1)
     if reqs >= 24:
-        # many requests: clusters no longer fit one CTA per SM (GPC sizes: 32 clusters of 4 put 16 CTAs two to
-        # an SM, which then finish last); plain split-KV spreads evenly (H200: b32 q8 27.7 -> 23.5, q1 14.4 -> 13.1)
-        n = max(1, min(tiles, target // reqs))
+        # Many requests: clusters no longer fit one CTA per SM, so plain split-KV spreads evenly.
+        n = _splits(tiles, target // reqs)
         return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=1)
-    # sliding window: one cluster per (request, KV pair); keep the grid small enough that all clusters
-    # are resident at once
+    # Sliding window: one cluster per (request, KV pair); keep the grid small enough that all
+    # clusters are resident at once.
     cs = 16
     limit = 2 * sms if L == 1 else sms
     if L == 8 and target == sms:
-        limit = (sms * 15) // 16   # one CTA per SM: clusters of 8 fit 15 per 132 SMs (GPC sizes), so stay below
+        limit = (sms * 15) // 16   # one CTA per SM: clusters of 8 fit 15 per 132 SMs, so stay below
     while cs > 4 and reqs * cs > limit:
         cs //= 2
     ncl = 1
-    while cs * ncl > tiles and ncl > 1:
-        ncl -= 1
     while cs * ncl > tiles and cs > 4:
         cs //= 2
     if cs * ncl > tiles or cs < 4:
-        n = max(1, min(tiles, target // reqs))
-        return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=max(1, min(n, 4)))
-    return dict(n_splits=cs * ncl, flat=0, cs=cs, ncl=ncl, nc=max(1, min(ncl, 4)))
-
-
-_CL = {}
+        n = _splits(tiles, target // reqs)
+        return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=_copies(n, 4))
+    return dict(n_splits=cs * ncl, flat=0, cs=cs, ncl=ncl, nc=_copies(ncl, 4))
 
 
 def _cluster_bufs(n_ctas, L, device):
     """sm_80 emulation buffers for the cluster path (unused on sm_90 beyond a pointer)."""
     key = str(device)
-    need = n_ctas * (L * 16 * 64 + 1024)
+    need = n_ctas * (L * Q_HEADS_PER_PAIR * HEAD_DIM + CLUSTER_SLACK)
     cur = _CL.get(key)
     if cur is None or cur[0].numel() < need or cur[1].numel() < n_ctas:
-        cur = (torch.zeros(max(need, 1 << 20), dtype=torch.float32, device=device),
-               torch.zeros(max(n_ctas, 1 << 12), dtype=torch.int32, device=device))
+        cur = (torch.zeros(max(need, CLUSTER_MIN_FLOATS), dtype=torch.float32, device=device),
+               torch.zeros(max(n_ctas, CLUSTER_MIN_INTS), dtype=torch.int32, device=device))
         _CL[key] = cur
     return cur
 
@@ -5096,13 +4191,12 @@ def _launch(data, dbg=None, _mod=None, pdl=None, **override):
                 plan["ncl"] = max(1, plan["n_splits"] // override["cs"])
             plan["n_splits"] = plan["cs"] * plan["ncl"]
             if "nc" not in override:
-                plan["nc"] = max(1, min(plan["ncl"], 4))
+                plan["nc"] = _copies(plan["ncl"], 4)
         elif "n_splits" in override and "nc" not in override:
-            plan["nc"] = 1 if plan["flat"] else max(1, min(plan["n_splits"], 4))
+            plan["nc"] = 1 if plan["flat"] else _copies(plan["n_splits"], 4)
     n_splits, flat, cs, ncl, nc = plan["n_splits"], plan["flat"], plan["cs"], plan["ncl"], plan["nc"]
-    # bit 0: TMA loads (compiled out by default); bit 1: cooperative finalize (all CTAs resident)
-    # cooperative finalize: only for the long single-request grids (their last-CTA finalize reads and zeroes
-    # tens of KB from one SM); the short sliding grids finalize faster in one CTA (measured on H200)
+    # Cooperative finalize (all CTAs resident): only for the long single-request grids, whose last-CTA
+    # finalize reads and zeroes tens of KB from one SM; the short sliding grids finalize faster in one CTA.
     if flat:   # grid-wide finalize after all segments (the kernel re-checks residency)
         coop = int(plan.get("coop", int(OKC_FLATCOOP and L == 8 and
                                         n_splits * pairs <= 2 * _num_sms(device))))
@@ -5110,12 +4204,14 @@ def _launch(data, dbg=None, _mod=None, pdl=None, **override):
         coop = int(plan.get("coop", 0 if (cs > 1 or n_splits < 64) else
                             int(n_splits * B * pairs <= 2 * _num_sms(device))))
     w0 = int(plan.get("w0", (OKC_W0_L1 if L == 1 else OKC_W0_L8) if (flat and (coop or L == 1)) else
-                      (OKC_W0_PR if (coop and not flat and B * pairs == 1) else 1024)))
+                      (OKC_W0_PR if (coop and not flat and B * pairs == 1) else W0_EVEN)))
     use_pdl = OKC_PDL if pdl is None else bool(pdl)
-    tma = int(plan.get("tma", 0)) | (coop << 1) | (min(max(w0, 0), 4095) << 2) | (int(use_pdl) << 16)
+    # tma packs the kernel-mode bitfield: bit 0 = TMA loads, bit 1 = cooperative finalize,
+    # bits 2..13 = w0 (flat first-CTA key share, /1024), bit 16 = PDL.
+    tma = int(plan.get("tma", 0)) | (coop << COOP_BIT) | (min(max(w0, 0), W0_MAX) << W0_SHIFT) | (int(use_pdl) << PDL_BIT)
     if flat or cs <= 1:
         cs, ncl = 0, 1
-    ws_acc, ws_l, ws_cnt = _workspace(B * pairs * nc * L * 16, device)
+    ws_acc, ws_l, ws_cnt = _workspace(B * pairs * nc * L * Q_HEADS_PER_PAIR, device)
     n_ctas = n_splits * (1 if flat else B) * pairs
     scratch, bar = _cluster_bufs(n_ctas if cs > 1 else 1, L, device)
     scale_log2 = cfg["sm_scale"] * cfg["qk_scale_factor"] * LOG2E
@@ -5128,9 +4224,9 @@ def _launch(data, dbg=None, _mod=None, pdl=None, **override):
 
 def _supported(cfg):
     P = cfg["page_size"]
-    return (cfg["head_dim"] == 64 and cfg["num_q_heads"] == 8 * cfg["num_kv_heads"] and cfg["num_kv_heads"] % 2 == 0
-            and cfg["q_len"] in (1, 8) and cfg["batch"] <= 512 and P > 0 and (P & (P - 1)) == 0
-            and cfg["batch"] * (cfg["num_kv_heads"] // 2) <= 4096)
+    return (cfg["head_dim"] == HEAD_DIM and cfg["num_q_heads"] == 8 * cfg["num_kv_heads"] and cfg["num_kv_heads"] % 2 == 0
+            and cfg["q_len"] in SUPPORTED_Q_LENS and cfg["batch"] <= MAX_BATCH and P > 0 and (P & (P - 1)) == 0
+            and cfg["batch"] * (cfg["num_kv_heads"] // 2) <= MAX_REQUEST_PAIRS)
 
 
 def _rms(x, eps=1e-5):
@@ -5140,7 +4236,7 @@ def _rms(x, eps=1e-5):
 
 def _rope(x, pos, theta):
     d = x.shape[-1]
-    inv_freq = 1.0 / (theta ** (torch.arange(0, d, 2, device=x.device).float() / d))
+    inv_freq = _inv_freq(theta, x.device, d // 2)
     ang = pos.float()[..., None] * inv_freq
     cos, sin = ang.cos().unsqueeze(-2), ang.sin().unsqueeze(-2)
     even, odd = x[..., 0::2], x[..., 1::2]
@@ -5164,6 +4260,7 @@ def _fallback(data):
     k_cache = data["k_cache"].view(-1, hkv, d)
     v_cache = data["v_cache"].view(-1, hkv, d)
     k_scale, v_scale = data["k_scale"], data["v_scale"]
+    # The new K/V land in the cache, exactly as the CUDA path writes them.
     k_cache[slots] = (k / k_scale).to(torch.float8_e4m3fn)
     v_cache[slots] = (v_in.reshape(batch, length, hkv, d).float() / v_scale).to(torch.float8_e4m3fn)
     t = torch.arange(table.shape[1] * page, device=q.device)
@@ -5186,7 +4283,8 @@ def _fits(data):
     """Sizes the CUDA path's 32-bit indexing covers (caches of any size are fine: 64-bit offsets past 4 GB)."""
     cfg = data["config"]
     out_elems = cfg["batch"] * cfg["q_len"] * cfg["num_q_heads"] * cfg["head_dim"]
-    return (data["qkv"].numel() < (1 << 31) and data["page_table"].numel() < (1 << 31) and out_elems < (1 << 31))
+    return (data["qkv"].numel() < INDEX_LIMIT and data["page_table"].numel() < INDEX_LIMIT
+            and out_elems < INDEX_LIMIT)
 
 
 def kernel_fn(data: Inputs) -> torch.Tensor:

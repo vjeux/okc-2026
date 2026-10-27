@@ -1,79 +1,109 @@
 # okc: problem=muse_decode_layer
-"""Muse Spark decode layer (team vjeux): one CUDA-graph-capturable kernel_fn built from four kernel sources.
+"""Muse Spark decode layer: one CUDA-graph-capturable kernel_fn.
 
-Provenance: every kernel here is our own team's work, copied (not imported) from our entries on this
-challenge's component boards:
-  * attention: the muse_attention_decode entry's fused kernel (QK-norm, RoPE, FP8 cache write, split-KV
-    attention, merge, per-head RMSNorm * sigmoid(gate)), driven by that entry's own launcher, plan and
-    workspace allocator, lifted verbatim (_launch7, _plan7, _workspace7, _supported7, _inv_freq7);
-  * experts: the muse_moe_w4a16 entry's NVFP4 MoE kernel in its three builds (M <= 8, 9..63, 64+), with that
-    entry's own scratch allocator (_ma_make_scratch) and build check (_ma_scales_prmt_exact: the PRMT scale
-    decode only when every local block-scale byte is a normal e4m3, else the LUT build) lifted verbatim;
-  * dense projections: the muse_bf16_proj entry's module (every name prefixed bfp_), incl. its fused
-    pooler + router launch;
-  * this file's glue: residual/norm boundaries, routing (top-8 of biased sigmoid scores; router weights as
-    BF16 hi + lo with FP32 accumulation; pre-expert RMSNorm), Triton split-K GEMMs, and SGLang's own FA3,
-    Marlin and cuBLAS paths from the judge image.
+Pipeline (one decode step, T = batch * q_len tokens)
+-----------------------------------------------------
+1.  qkv projection (cuBLAS, the bf16_proj kernel, or a Triton split-K GEMM --
+    prepare() times the three and pins the winner per (T, matrix)).
+2.  Attention: the muse_attention_decode entry's fused kernel (QK-norm,
+    RoPE, FP8 cache write, split-KV FP8 attention, merge, per-head
+    RMSNorm * sigmoid(gate)) for the shapes it supports; otherwise the glue's
+    own QK-prep Triton kernel plus SGLang's FA3 (or a Triton split-KV
+    attention fallback when SGLang is unavailable).
+3.  o projection, then the first residual boundary (residual add, residual
+    gate, pre-FFN norm) -- one-program-per-token kernels or parallel
+    atomic-sum kernels, per T, timed in prepare().
+4.  Pooler + router (bf16_proj's fused launch, its two separate launches, or
+    the Triton split-K GEMM), routing (top-8 of biased sigmoid scores), and
+    the pre-expert norm.
+5.  Experts: the muse_moe_w4a16 entry's NVFP4 kernel (three compile-time
+    builds by token count), or SGLang's Marlin NVFP4 path, whichever
+    prepare() timed faster per T.
+6.  Unpooler, then the second residual boundary (post-FFN norm, next layer's
+    pre-attention norm).
 
-Selection: prepare() times each backend per (token count, matrix), and the expert kernels per token count,
-on the judge's own GPU with synthetic activations (it reads only weights, never data), then fixes the
-choices; untuned token counts take the next tuned bucket's. Attention backend by shape (q_len, window, batch).
+Provenance: the attention, MoE and dense kernels are our own team's entries
+on this challenge's component boards, copied (not imported). The CUDA sources
+(ATT7_CUDA_SRC, MOE_CUDA_SRC, the bfp_* template strings) and the bfp_*
+generators are kept verbatim -- they are the tuned, proven kernels. The glue
+(boundaries, routing, tuning, launchers) is this file's own code.
 
-Precision: BF16 weights stay BF16 (or bf16_proj's lossless 12-bit encoding, exact escape correction);
-NVFP4 experts stay NVFP4; norms apply (1 + w) formed in FP32 at use; FP8 queries and FP8 KV cache as
-SGLang; softmax P in f16, or e4m3 where SGLang's FA3 rounds it to e4m3 too; FP32 accumulation throughout;
-activations BF16 wherever SGLang keeps BF16.
+Precision: BF16 weights stay BF16 (or bf16_proj's lossless 12-bit encoding
+with exact escape correction); NVFP4 experts stay NVFP4; norms apply
+(1 + w) formed in FP32 at use; FP8 queries / FP8 KV cache as SGLang;
+softmax P in f16, or e4m3 where SGLang's FA3 rounds it to e4m3 too;
+FP32 accumulation throughout; activations BF16 wherever SGLang keeps BF16.
 
-Launch order: at T <= 32 tokens every kernel of the layer is launched with programmatic dependent launch
-(PDL). Each one waits (griddepcontrol.wait) before its first read of data produced in this call; only
-weights, and inputs that no kernel in this call writes, are loaded before the wait. Above 32 tokens all
-launches are plain stream-ordered.
+Selection: prepare() times each backend per (token count, matrix) and the
+expert kernels per token count, on the judge's own GPU with synthetic
+activations (it reads only weights, never data), then fixes the choices;
+untuned token counts take the next tuned bucket's.
 
-Safety: every scratch/workspace buffer this file allocates or caches for a component is followed by
-sentinel words; prepare() checks them after the tuner and an attention self-test have run every path.
+OKC rules: one Python file; native CUDA only via
+torch.utils.cpp_extension.load_inline; CUDA-graph capturable (no host syncs
+in timed paths -- prepare() and the tuners sync, kernel_fn does not); fresh
+inputs each call, no caching across calls (module-level caches hold only
+compiled extensions and per-device scratch, never activations).
+Safety: every scratch/workspace buffer is followed by sentinel words;
+prepare() checks them after the tuner and the attention self-test.
 """
 
-import math
+import os
+import threading
+import types
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch.utils.cpp_extension import load_inline
 
+# Model shape (the task's dimensions, not tunables). The CUDA sources carry
+# their own copies because they compile standalone; keep them in sync by hand.
 HIDDEN = 8192
 D_EXPERT = 4096
 LOCAL_EXPERTS = 32
 N_EXPERTS = 256
 TOP_K = 8
-QKV = 2304
-ROUTER_MULT = 0.1767766952966369
+QKV_ROWS = 2304
+NUM_Q_HEADS = 16
+NUM_KV_HEADS = 2
+HEAD_DIM = 64
+Q_DIM = NUM_Q_HEADS * HEAD_DIM  # 1024: q / o-projection width
+ROPE_THETA = 500000.0
+ROUTER_MULT = 0.1767766952966369  # router logit scale (1 / sqrt(32))
 LOG2E = 1.4426950408889634
 
 _TUNE_LOG = False
-FORCE_PBMAX = None
-# Programmatic Dependent Launch for this file's Triton glue: each kernel launches while its producer drains and
-# waits (griddepcontrol.wait) right before its first read of producer data; weights and older inputs load before.
+FORCE_PBMAX = None  # override the tuner's pbmax (no consumer; key kept for state shape)
+# Programmatic Dependent Launch for this file's Triton glue: each kernel launches
+# while its producer drains and waits (griddepcontrol.wait) right before its
+# first read of producer data; weights and older inputs load before the wait.
 PDL = True
-PDL_MAX_T = 32   # measured: a launch-latency win at decode sizes (d1 +2%), a ~1% loss at T = 256 (big grids)
+PDL_MAX_T = 32  # a launch-latency win at decode sizes, a ~1% loss at T = 256
 
 
 def _pdl(T):
     return PDL and T <= PDL_MAX_T
-# The moe agent's kernel wins at every token count we tune (their board is 1.76x); the tuner may only
-# depart from it when another backend is clearly faster, so a noisy measurement cannot flip a pick.
+
+
+# The MoE agent's kernel wins at every token count we tune; the tuner may only
+# depart from it when another backend is clearly faster, so a noisy measurement
+# cannot flip a pick.
 DEFAULT_MOE = "agent"
 TUNE_MARGIN = 0.95
-# Dense picks the isolated tuner gets wrong part of the time (it cannot see PDL overlap in the chain), pinned to the
-# winner measured in the whole layer (pickab.py, v132, 31 reps): o at T=32 bfp 166.7 vs cuBLAS 176.1 us (32x1 sliding);
-# qkv at T=128 cuBLAS 249.4 vs split-K 251.0 (16x8 sliding); qkv at T=256 cuBLAS 351.1 vs split-K 353.5 (32x8 sliding).
-# pr at T=32: separate bfp 166.8 / 318.7 vs fused bfpf 167.9 / 320.2 us (32x1 sliding / full). T=256 pr/un: 4-way tie.
-# un at T=1/8 (the 1024-row slice): bfp 80.7 / 80.1 / 116.7 / 138.2 vs split-K 81.9 / 81.2 / 118.8 / 140.1 us (1x1 s/f, 1x8 s/f).
+# Dense picks pinned to the winners measured in the whole layer: the isolated
+# tuner sometimes gets them wrong because it cannot see PDL overlap in the chain.
 PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp", (32, "pr"): "bfp",
-            (128, "qkv"): True, (256, "qkv"): True}   # (8, "o"): in-chain sk2 112.5/133.4 vs cuBLAS 114.7/136.3 us (Oct 26)
-FORCE_MM = None
-FORCE_GLUEV2 = None  # None: tuner's choice; True/False: force the parallel boundary/router kernels      # None: the tuner's per-(T, matrix) dense choice; else force one backend everywhere   # set to 0/1/2 to override the tuner's megakernel threshold (pod experiments)
+            (128, "qkv"): True, (256, "qkv"): True}
+FORCE_GLUEV2 = None  # None: tuner's choice; True/False: force the parallel boundary/router kernels
 
-# Fused decode attention (QK-norm, RoPE, FP8 cache write, split-KV FP8 attention, merge, rmsnorm * sigmoid(gate)):
-# copied from our muse_attention_decode entry (same author), compiled as its own extension.
+
+# ---------------------------------------------------------------------------
+# Attention: fused decode kernel (verbatim CUDA source, own extension).
+# QK-norm, RoPE, FP8 cache write, split-KV FP8 attention, merge,
+# per-head RMSNorm * sigmoid(gate).
+# ---------------------------------------------------------------------------
 ATT7_CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -4948,52 +4978,19 @@ def _att7():
 
 _WS7 = {}
 _NUM_SMS7 = {}
-LOG2E = 1.4426950408889634
-
-
-def _build(tag="", flags=()):
-    from torch.utils.cpp_extension import load_inline
-    major, minor = torch.cuda.get_device_capability()
-    arch = f"{major}{minor}" + ("a" if major >= 9 else "")
-    return load_inline(
-        name=f"okc_attn_v298{tag}_{arch}",
-        cpp_sources=CPP_SRC,
-        cuda_sources=CUDA_SRC,
-        functions=["run"],
-        extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}", f"-DOKC_SM90={1 if major >= 9 else 0}",
-                           "--expt-relaxed-constexpr", *flags],
-        verbose=False,
-    )
-
-
-def _module():
-    global _MOD
-    if _MOD is None:
-        _MOD = _build()
-    return _MOD
-
-
-def _inv_freq(theta, device):
-    key = (float(theta), str(device))
-    t = _INV_FREQ.get(key)
-    if t is None:
-        if theta:
-            t = 1.0 / (theta ** (torch.arange(0, 64, 2, device=device).float() / 64))
-        else:
-            t = torch.zeros(32, device=device)
-        _INV_FREQ[key] = t.float().contiguous()
-    return t
 
 
 def _workspace7(n_rows, device):
-    """Persistent FP32 accumulators (zero between calls: the last CTA resets them)."""
+    """Persistent FP32 accumulators (zero between calls: the last CTA resets
+    them), each followed by sentinel words -- see _guarded / _check_guards."""
     key = str(device)
     ws = _WS7.get(key)
     if ws is None or ws[0].numel() < n_rows * 64:
         n = max(n_rows, 1 << 15)
-        ws = (torch.zeros(n * 64, dtype=torch.float32, device=device),
-              torch.zeros(n, dtype=torch.float32, device=device),
-              torch.zeros(n, dtype=torch.int32, device=device))
+        ws = tuple(_guarded(t) for t in (
+            torch.zeros(n * 64, dtype=torch.float32, device=device),
+            torch.zeros(n, dtype=torch.float32, device=device),
+            torch.zeros(n, dtype=torch.int32, device=device)))
         _WS7[key] = ws
     return ws
 
@@ -5103,18 +5100,17 @@ _CL7 = {}
 
 
 def _cluster_bufs7(n_ctas, L, device):
-    """sm_80 emulation buffers for the cluster path (unused on sm_90 beyond a pointer)."""
+    """sm_80 emulation buffers for the cluster path (unused on sm_90 beyond a
+    pointer), each followed by sentinel words -- see _guarded."""
     key = str(device)
     need = n_ctas * (L * 16 * 64 + 1024)
     cur = _CL7.get(key)
     if cur is None or cur[0].numel() < need or cur[1].numel() < n_ctas:
-        cur = (torch.zeros(max(need, 1 << 20), dtype=torch.float32, device=device),
-               torch.zeros(max(n_ctas, 1 << 12), dtype=torch.int32, device=device))
+        cur = tuple(_guarded(t) for t in (
+            torch.zeros(max(need, 1 << 20), dtype=torch.float32, device=device),
+            torch.zeros(max(n_ctas, 1 << 12), dtype=torch.int32, device=device)))
         _CL7[key] = cur
     return cur
-
-
-
 
 
 # Routed-experts kernel for T > 32: copied from our muse_moe_w4a16 entry (same author), own extension.
@@ -8883,63 +8879,12 @@ def _wgs_on():
     return any("-DOKC_WGS=1" in tuple(d) for d in (MOE_DEFINES, MOE_TINY_DEFINES, MOE_TINY2_DEFINES, MOE_MID_DEFINES))
 
 
-
-
-# ---------------------------------------------------------------------------------------------------
-# The bf16_proj agent's dense kernels (copied from our muse_bf16_proj entry; every top-level name prefixed
-# bfp_). Used for the projections where the tuner finds them faster than cuBLAS or my Triton split-K.
-# ---------------------------------------------------------------------------------------------------
-# okc: problem=muse_bf16_proj
-"""Dense projections for Muse Spark Open: skinny swap-AB tensor-core GEMV/GEMM with
-losslessly compressed BF16 weights.
-
-out[m, n] = x[m, k] @ W[n, k]^T.  For m <= 64 every weight byte is streamed once from HBM
-straight into registers, in mma.m16n8k16 A-fragment order (prepared once), and multiplied
-against x (staged in shared memory) on BF16 tensor cores with FP32 accumulation.
-
-Lossless 12-bit weights (BF16 projections): each BF16 weight is stored as its low byte
-(exponent bit 0 + 7 mantissa bits, raw) and a 4-bit code for its high byte (sign + exponent
-bits 7..1, as an offset into an 8-value window chosen per matrix).  The kernel rebuilds the
-exact BF16 bits in registers (a few integer ops per weight).  The rare weights whose exponent
-falls outside the window (tiny magnitudes) are exact-corrected: the kernel adds
-x[:, k] * (w - w_decoded) for each of them (both factors exact in FP32), so every output
-equals the product with the original weights up to FP32 accumulation order.
-
-Split-K across warps (shared-memory reduction) and across CTAs (FP32 partials + a
-self-resetting semaphore; the last CTA of a row block reduces) keeps ~128 CTAs streaming on
-every shape.  The router's FP32 weights run as a BF16 hi + lo pair (concatenated along K)
-with FP32 accumulation, as SGLang does above 8 tokens.
-"""
-
-from typing import TypedDict
-
-import torch
-import torch.nn.functional as F
-import sys
-
-from torch.utils.cpp_extension import load_inline
-import os as _os
-bfp__SK2_DELAY = int(_os.environ.get("SK2_DELAY_ESC", "0"))   # debug only: delay (ns) of escape warp 0 + ring spin-limit trap
-
-
-class bfp_Weights(TypedDict):
-    qkv_gate: torch.Tensor  # bfloat16 [2304, 8192]
-    o: torch.Tensor         # bfloat16 [8192, 1024]
-    pooler: torch.Tensor    # bfloat16 [4096, 8192]
-    unpooler: torch.Tensor  # bfloat16 [8192, 4096]
-    router: torch.Tensor    # float32 [256, 8192]
-
-
-class bfp_Config(TypedDict):
-    m: int
-    n: int
-    k: int
-    layer: str
-
-
-class bfp_Inputs(TypedDict):
-    x: torch.Tensor  # bfloat16 [m, k]
-    config: bfp_Config
+# ---------------------------------------------------------------------------
+# Dense projections: the muse_bf16_proj entry's kernels (every name bfp_*),
+# used where the tuner finds them faster than cuBLAS or the Triton split-K.
+# The CUDA template strings and their generators below are kept verbatim.
+# ---------------------------------------------------------------------------
+bfp__SK2_DELAY = int(os.environ.get("SK2_DELAY_ESC", "0"))  # debug only: delay (ns) of escape warp 0 + ring spin-limit trap
 
 
 bfp_CUDA_SRC = r"""
@@ -10865,44 +10810,12 @@ void sk2f(torch::Tensor Ws, torch::Tensor Wsr, torch::Tensor x, torch::Tensor ou
 void sk2_set_pdl(int64_t n);
 """
 
-# (layer, mt) -> (splits, RG, WS); grid = (N / (16 RG), splits) ~ 128 CTAs
-bfp_CONFIGS = {
-    ("pooler", 1): (1, 2, 8), ("pooler", 2): (2, 4, 4), ("pooler", 4): (4, 8, 2), ("pooler", 8): (16, 8, 1),
-    ("unpooler", 1): (2, 1, 8), ("unpooler", 2): (1, 4, 4), ("unpooler", 4): (2, 8, 2), ("unpooler", 8): (8, 8, 1),
-    ("qkv_gate", 1): (8, 9, 2), ("qkv_gate", 2): (8, 9, 2), ("qkv_gate", 4): (8, 9, 1), ("qkv_gate", 8): (16, 9, 1),
-    ("o", 1): (1, 4, 4), ("o", 2): (1, 4, 4), ("o", 4): (1, 4, 4), ("o", 8): (2, 8, 1),
-    ("router", 1): (8, 1, 8), ("router", 2): (8, 1, 8), ("router", 4): (8, 1, 8), ("router", 8): (16, 1, 4),
-}
-bfp_MAX_SKINNY_M = 32
 bfp_w_rows = {"qkv_gate": 2304, "o": 8192, "pooler": 4096, "unpooler": 8192, "router": 256}
 bfp_COMPRESS = {"qkv_gate", "o", "pooler", "unpooler"}
-bfp_D_PLAIN = 16
-bfp_D_COMP = 12
-bfp_PF = 0
 
 bfp__ext = None
 
 
-def bfp__dispatch_src():
-    return ""  # LDG skinny kernel unused in v6 (TMA path); keep the template uninstantiated
-    lines = []
-    for (layer, mt), (splits, rg, wsn) in sorted(bfp_CONFIGS.items()):
-        f32 = layer == "router"
-        ot = "float" if f32 else "__nv_bfloat16"
-        for comp in ((0,) if f32 else (0, 1)):
-            d = bfp_D_COMP if comp else (bfp_D_PLAIN if rg * wsn <= 9 and mt <= 4 else 8)
-            lines.append(f"if (mt == {mt} && rg == {rg} && wsn == {wsn} && comp == {comp} && out_f32 == {str(f32).lower()}) "
-                         f"{{ launch<{mt}, {rg}, {wsn}, {d}, {str(bool(comp)).lower()}, {bfp_PF}, {ot}>(Wp, x, out, ws, counters, "
-                         f"poff, pk, pr, pd, base4, M, N, Kp, Kx, splits, nrg); return; }}")
-    return "\n  ".join(dict.fromkeys(lines))
-
-
-bfp_MID_CONFIGS = {  # (layer, bn) -> (nwg, splits); grid = (N / (64 nwg), splits) <= 132 CTAs (co-resident)
-    ("pooler", 128): (2, 4), ("unpooler", 128): (2, 2), ("qkv_gate", 128): (2, 7), ("o", 128): (2, 2),
-    ("router", 128): (2, 64),
-    ("pooler", 256): (2, 4), ("unpooler", 256): (2, 2), ("qkv_gate", 256): (2, 7), ("o", 256): (2, 2),
-    ("router", 256): (2, 64),
-}
 bfp_TMA_CONFIGS = {  # (layer, mt) -> (splits, RG, WS, KS); x chunk M*Kc*2 small, ~128 CTAs; mt 0 = m == 1
     ("pooler", 0): (1, 2, 8, 4), ("pooler", 1): (2, 4, 4, 4), ("pooler", 2): (4, 8, 2, 4), ("pooler", 4): (8, 16, 1, 4),
     ("unpooler", 0): (2, 1, 8, 4), ("unpooler", 1): (2, 1, 8, 4), ("unpooler", 2): (2, 8, 2, 4), ("unpooler", 4): (4, 16, 1, 4),
@@ -10910,8 +10823,6 @@ bfp_TMA_CONFIGS = {  # (layer, mt) -> (splits, RG, WS, KS); x chunk M*Kc*2 small
     ("o", 0): (1, 4, 4, 4), ("o", 1): (1, 4, 4, 4), ("o", 2): (1, 4, 4, 4), ("o", 4): (1, 4, 4, 4),
     ("router", 0): (8, 1, 8, 4), ("router", 1): (8, 1, 8, 4), ("router", 2): (8, 1, 8, 4), ("router", 4): (8, 1, 8, 4),
 }
-bfp_TMA_KS = 4
-bfp_USE_TMA = True
 bfp_USE_WGM = True   # m >= 9 compressed configs with RG % 4 == 0 use RS-wgmma (sm_90)
 bfp_WGM_SM80_TEST = False  # local check of the wgmma path's data layout (mma.sync emulation on sm_80)
 
@@ -11279,7 +11190,6 @@ def bfp__run_gq(x, layer, m, n, k, state):
     return out
 
 
-
 bfp_WIDE_CONFIGS = {  # (layer, tok, nz) -> (nwg, splits, stages); grid = (N / (64 nwg), splits, nz) <= 132 (co-resident)
     ("pooler", 64, 1): (1, 2, 8), ("unpooler", 64, 1): (1, 1, 8), ("qkv_gate", 64, 1): (1, 3, 8), ("o", 64, 1): (1, 1, 8),
     ("pooler", 128, 1): (1, 2, 7), ("unpooler", 128, 1): (1, 1, 7), ("qkv_gate", 128, 1): (1, 3, 7), ("o", 128, 1): (1, 1, 7),
@@ -11304,28 +11214,6 @@ def bfp__wide_src(sm90):
                      f"{{ launch_wide<{nwg}, {tok}, {stages}, {str(hl).lower()}, {ot}>(Wst, x, out, ws, counters, ptab, pmax, base4, "
                      f"M, N, K, splits); return; }}")
     return bfp_WIDE_SRC.replace("@@WIDE_DISPATCH@@", "\n  ".join(dict.fromkeys(lines)))
-
-
-bfp_MID_STAGES = 4
-bfp_MID_DU = 2
-
-
-def bfp__mid_src(sm90):
-    if not sm90:
-        return ('void mid(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, '
-                'torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, '
-                'int64_t, int64_t, int64_t, int64_t) { TORCH_CHECK(false, "mid needs sm_90"); }')
-    lines = []
-    for (layer, bn), (nwg, splits) in []:
-        f32 = layer == "router"
-        ot = "float" if f32 else "__nv_bfloat16"
-        for comp in ((0,) if f32 else (0, 1)):
-            lines.append(f"if (nwg == {nwg} && bn == {bn} && comp == {comp} && out_f32 == {str(f32).lower()}) "
-                         f"{{ launch_mid<{nwg}, {bn}, {bfp_MID_STAGES}, {bfp_MID_DU}, {str(bool(comp)).lower()}, {ot}>(Wp, x, out, ws, "
-                         f"counters, poff, pk, pr, pd, base4, M, N, Kp, Kx, splits, nrg); return; }}")
-    bns = sorted({bn for (_, bn) in bfp_MID_CONFIGS})
-    return (MID_SRC.replace("@@WGMMA_DEFS@@", bfp_wgmma_defs(bns))
-            .replace("@@MID_DISPATCH@@", "\n  ".join(dict.fromkeys(lines))))
 
 
 def bfp__get_ext():
@@ -11518,7 +11406,6 @@ bfp_SK2_PICK = {  # (layer, tokr) -> config name
     ('unpooler', 16): 'unpooler16h_r100',
     ('unpooler', 32): 'unpooler32_r144',
 }
-bfp_SK2_ROT = False
 bfp_SK2_K = {"pooler": 8192, "unpooler": 4096, "o": 1024, "qkv_gate": 8192, "router": 8192}
 bfp_USE_SK2 = True
 bfp_WIDE_BF16 = False  # the wide (RS-wgmma) kernel never beats cuBLAS for BF16 m 33..256
@@ -11913,12 +11800,10 @@ def bfp__selftest(weights, state):
                     out = bfp__run(ch, x, layer, m, nn, k, state).double()
                     torch.cuda.synchronize()
                     err = ((out - ref).norm() / ref.norm()).item()
-                except RuntimeError as e:  # launch failure -> fall back
+                except RuntimeError:  # launch failure -> fall back
                     err = float("inf")
-                    if False: print(f"[okc] selftest {layer} m={m} {ch[0]}: {e}", file=sys.stderr)
                 if not err < tol:
                     state["disabled"].add(key)
-                    if False: print(f"[okc] selftest {layer} m={m} {ch[0]}: rel err {err:.3e} -> disabled", file=sys.stderr)
 
 
 def bfp__run_skinny(x, layer, m, n, k, state, cfg, tu_key, dg=0):
@@ -12078,14 +11963,6 @@ def bfp__autotune(weights, state):
             del graphs
     del flush
     torch.cuda.synchronize()
-    # one line per shape in the run's log: candidate times (us, raw graph replay incl. ~4 us replay cost) and the pick
-    for layer, m, tl in state.get("tune_log", []):
-        ch = state["choice"][(layer, m)]
-        desc = " ".join(f"{name}{'/' + 'x'.join(map(str, c[1])) if c[0] == 'skinny' else ''}={t}"
-                        for (name, t), c in zip(tl, bfp__candidates(layer, m, state)))
-        pick = ch[0] + ("/" + "x".join(map(str, ch[1])) if ch[0] == "skinny" else "")
-        if False: print(f"[okc] tune {layer} m={m}: {desc} -> {pick}", file=sys.stderr)
-    if False: print(f"[okc] disabled: {sorted(state['disabled'])}", file=sys.stderr)
 
 
 def bfp__nearby_choice(layer, m, state):
@@ -12120,7 +11997,6 @@ def bfp__diag(x, layer, m, n, k, state, choice):
             bfp__run_skinny(x, layer, m, n, k, state, choice[1], choice[2], dg)
 
 
-
 def _bfp_prepare(weights, st):
     """Their prepare() on the five dense matrices, guarded: any failure just disables the backend."""
     st["bfp"] = None
@@ -12150,7 +12026,6 @@ def _bfp_gemm(st, name, x, m, n, k):
 
 _MA_MMAX = 384
 _MA_EMAX = _MA_MMAX * 8
-_MA_JMAX = 32 + _MA_EMAX // 64 + 8
 
 
 WGS_FIXF = 2 * 160 * 4 * 4096 + 2 * 160 * 4 + 136 * 16   # moe WGS_FIXF: stream-K fixups + doneAs after ybuf (zero between calls)
@@ -12158,7 +12033,7 @@ WGS_XROWS = _MA_EMAX + 8 * (32 + _MA_EMAX // 32 + 8)  # >= moe WGS_XROWS for FT_
 
 
 def _ma_make_scratch(dev):
-    return [torch.zeros(8 + 1024 + _MA_EMAX, dtype=torch.int32, device=dev),  # counters + doneA (>= any build's _MA_JMAX) + ss copy 1
+    return [torch.zeros(8 + 1024 + _MA_EMAX, dtype=torch.int32, device=dev),  # counters + doneA + ss copy 1
             torch.zeros(_MA_EMAX + _MA_EMAX * 4096 + WGS_FIXF, dtype=torch.float32, device=dev),
             torch.zeros((_MA_EMAX + 2 * WGS_XROWS) * 4096, dtype=torch.bfloat16, device=dev)]  # inter, then WGS xA / xB
 
@@ -12194,14 +12069,9 @@ def _ma_prepare(weights, st):
                                      for e in range(32)]))
         st["ma_w"].append(torch.cat([_wgs_copy(weights["w2"][e].view(torch.uint8), weights["w2_sf"][e], rowsB)
                                      for e in range(32)]))
-    # Their scratch layout, built by their own _make_scratch (lifted verbatim by mkversion): its size depends on
-    # every build their kernel_fn may pick (JMAX = 32 + EMAX / FT_T + 8 per build). v75/v78 sized it from the
-    # 64-token formula and the 32-token MID build wrote 48 ints past the end.
+    # Scratch is sized for every build kernel_fn may pick: a scratch sized
+    # from the 64-token formula once let the 32-token MID build write past it.
     st["ma_scratch"] = [_guarded(t) for t in _ma_make_scratch(dev)]
-
-
-
-
 
 
 def _to_i32(x64):
@@ -12223,20 +12093,6 @@ def _repack_q(wp, interleave):
          | ((B0 >> 4) << 16) | ((B1 >> 4) << 20) | ((B2 >> 4) << 24) | ((B3 >> 4) << 28))
     w = _to_i32(w).reshape(E, R // 16, 64, 4, 32).permute(0, 1, 2, 4, 3).contiguous()
     return w
-
-
-def _prepack_frag(w):
-    """bf16 [N, K] -> int32 [N/16, K/16, 32 lanes, 4]: mma.m16n8k16 A-fragment order per (rowblock, k16)."""
-    N, K = w.shape
-    dev = w.device
-    g = torch.arange(8, device=dev).view(8, 1, 1)
-    c = torch.arange(4, device=dev).view(1, 4, 1)
-    j = torch.arange(8, device=dev).view(1, 1, 8)
-    rows = g + 8 * ((j // 2) % 2)
-    cols = 2 * c + (j % 2) + 8 * (j // 4)
-    x = w.view(N // 16, 16, K // 16, 16).permute(0, 2, 1, 3)  # [rb, kb, row, col]
-    f = x[:, :, rows, cols]  # [rb, kb, 8, 4, 8]
-    return f.reshape(N // 16, K // 16, 32, 8).contiguous().view(torch.int32)
 
 
 def _repack_s(sf, interleave):
@@ -12383,14 +12239,6 @@ def dense(x, w, T, state=None, name=None):
 # ----------------------------------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------------------------------
-@triton.jit
-def _e4m3_to_f32(b):
-    """uint8/int32 e4m3fn bits -> float32 (exact)."""
-    b = b.to(tl.int32)
-    h = (((b & 0x7F) << 7) | ((b & 0x80) << 8)).to(tl.int16).to(tl.float16, bitcast=True)
-    return h.to(tl.float32) * 256.0
-
-
 @triton.jit
 def _f32_to_e4m3(x):
     """float32 -> e4m3fn bits (int32), round to nearest even, saturating to +-448."""
@@ -12865,124 +12713,9 @@ def _route_split(POOLED, LOGITS, BIAS, GPRE, IDS, WTS, XOUT, LS, LIDS, PERMUTED:
         tl.store(XOUT + t * 4096 + c, x.to(tl.bfloat16))
 
 
-@triton.jit
-def _moe_align(IDS, LS, R, CNT, OFF, SORTED, RPOS, ACTIVE, NACT, CH: tl.constexpr):
-    start = tl.load(LS)
-    ex = tl.arange(0, 32)
-    cnt = tl.zeros([32], dtype=tl.int32)
-    for c0 in range(0, R, CH):
-        r = c0 + tl.arange(0, CH)
-        rv = r < R
-        ids = tl.load(IDS + r, mask=rv, other=0)
-        local = (ids - start + 256) % 256
-        isl = rv & (local < 32)
-        oh = ((local[:, None] == ex[None, :]) & isl[:, None]).to(tl.int32)
-        cnt += tl.sum(oh, 0)
-    off = tl.cumsum(cnt, 0) - cnt
-    run = off
-    for c0 in range(0, R, CH):
-        r = c0 + tl.arange(0, CH)
-        rv = r < R
-        ids = tl.load(IDS + r, mask=rv, other=0)
-        local = (ids - start + 256) % 256
-        isl = rv & (local < 32)
-        oh = ((local[:, None] == ex[None, :]) & isl[:, None]).to(tl.int32)
-        rank = tl.sum((tl.cumsum(oh, 0) - oh) * oh, 1)
-        pos = tl.sum(run[None, :] * oh, 1) + rank
-        tl.store(RPOS + r, tl.where(isl, pos, -1), mask=rv)
-        tl.store(SORTED + pos, r, mask=isl)
-        run += tl.sum(oh, 0)
-    tl.store(CNT + ex, cnt)
-    tl.store(OFF + ex, off)
-    act = (cnt > 0).to(tl.int32)
-    arank = tl.cumsum(act, 0) - act
-    tl.store(ACTIVE + arank, ex, mask=act > 0)
-    tl.store(NACT, tl.sum(act, 0))
-
-
 # ----------------------------------------------------------------------------------------------
 # MoE experts (NVFP4 W4A16)
 # ----------------------------------------------------------------------------------------------
-@triton.jit
-def _dequant(w8, s8, BN: tl.constexpr, BK: tl.constexpr):
-    """w8 uint8 [BN, BK/2] packed e2m1 (low nibble first), s8 uint8 [BN, BK/16] e4m3 -> bf16 [BN, BK]."""
-    w = w8.to(tl.int32)
-    codes = tl.reshape(tl.join(w & 0xF, w >> 4), [BN, BK])
-    v = (((codes & 7) << 9) | ((codes & 8) << 12)).to(tl.int16).to(tl.float16, bitcast=True)
-    sc = _e4m3_to_f32(s8) * 16384.0
-    scf = tl.reshape(tl.broadcast_to(sc[:, :, None], [BN, BK // 16, 16]), [BN, BK])
-    return (v.to(tl.float32) * scf).to(tl.bfloat16)
-
-
-@triton.jit
-def _moe_w13(X, W13, SF13, GS13, SORTED, CNT, OFF, ACTIVE, NACT, INTER,
-             BN: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr):
-    a = tl.program_id(0)
-    j = tl.program_id(1)
-    if a >= tl.load(NACT):
-        return
-    e = tl.load(ACTIVE + a)
-    n_e = tl.load(CNT + e)
-    off = tl.load(OFF + e)
-    rows = j * BN + tl.arange(0, BN)
-    wbase = W13 + e.to(tl.int64) * (8192 * 2048)
-    sbase = SF13 + e.to(tl.int64) * (8192 * 256)
-    gs = tl.load(GS13 + e)
-    tt = tl.arange(0, BT)
-    for t0 in range(0, n_e, BT):
-        rv = (t0 + tt) < n_e
-        route = tl.load(SORTED + off + t0 + tt, mask=rv, other=0)
-        tok = route // 8
-        accg = tl.zeros([BN, BT], dtype=tl.float32)
-        accu = tl.zeros([BN, BT], dtype=tl.float32)
-        for k in range(0, 4096, BK):
-            x = tl.load(X + tok[None, :] * 4096 + (k + tl.arange(0, BK))[:, None], mask=rv[None, :], other=0.0)
-            cb = k // 2 + tl.arange(0, BK // 2)
-            cs = k // 16 + tl.arange(0, BK // 16)
-            wg = tl.load(wbase + rows[:, None] * 2048 + cb[None, :])
-            wu = tl.load(wbase + (rows + 4096)[:, None] * 2048 + cb[None, :])
-            sg = tl.load(sbase + rows[:, None] * 256 + cs[None, :])
-            su = tl.load(sbase + (rows + 4096)[:, None] * 256 + cs[None, :])
-            accg = tl.dot(_dequant(wg, sg, BN, BK), x, accg)
-            accu = tl.dot(_dequant(wu, su, BN, BK), x, accu)
-        gg = accg * gs
-        uu = accu * gs
-        inter = gg / (1.0 + tl.exp(-gg)) * uu
-        tl.store(INTER + (off + t0 + tt)[None, :] * 4096 + rows[:, None], inter.to(tl.bfloat16), mask=rv[None, :])
-
-
-@triton.jit
-def _moe_w2(INTER, W2, SF2, GS2, POSTW, CNT, OFF, ACTIVE, NACT, Z, SSP,
-            BN: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr, NT: tl.constexpr):
-    a = tl.program_id(0)
-    j = tl.program_id(1)
-    if a >= tl.load(NACT):
-        return
-    e = tl.load(ACTIVE + a)
-    n_e = tl.load(CNT + e)
-    off = tl.load(OFF + e)
-    rows = j * BN + tl.arange(0, BN)
-    wbase = W2 + e.to(tl.int64) * (4096 * 2048)
-    sbase = SF2 + e.to(tl.int64) * (4096 * 256)
-    gs = tl.load(GS2 + e)
-    pw = tl.load(POSTW + rows).to(tl.float32)
-    tt = tl.arange(0, BT)
-    for t0 in range(0, n_e, BT):
-        rv = (t0 + tt) < n_e
-        rr = off + t0 + tt
-        acc = tl.zeros([BN, BT], dtype=tl.float32)
-        for k in range(0, 4096, BK):
-            x = tl.load(INTER + rr[None, :] * 4096 + (k + tl.arange(0, BK))[:, None], mask=rv[None, :], other=0.0)
-            cb = k // 2 + tl.arange(0, BK // 2)
-            cs = k // 16 + tl.arange(0, BK // 16)
-            w = tl.load(wbase + rows[:, None] * 2048 + cb[None, :])
-            s = tl.load(sbase + rows[:, None] * 256 + cs[None, :])
-            acc = tl.dot(_dequant(w, s, BN, BK), x, acc)
-        z = acc * gs * pw[:, None]
-        tl.store(Z + rr[None, :] * 4096 + rows[:, None], z.to(tl.bfloat16), mask=rv[None, :])
-        tl.store(SSP + rr * NT + j, tl.sum(z * z, 0), mask=rv)
-
-
 @triton.jit
 def _pexp_norm_sum(x_ptr, w_ptr, s_ptr, out_ptr, ids_ptr, TOPK: tl.constexpr, H: tl.constexpr, eps,
                    BLOCK_H: tl.constexpr):
@@ -13001,21 +12734,6 @@ def _pexp_norm_sum(x_ptr, w_ptr, s_ptr, out_ptr, ids_ptr, TOPK: tl.constexpr, H:
             y = y * tl.rsqrt(tl.sum(y * y, axis=0) / H + eps)
             acc += y * tl.load(s_ptr + tok * TOPK + k).to(tl.float32)
     tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def _moe_combine(Z, SSP, RPOS, WTS, M, NT: tl.constexpr):
-    t = tl.program_id(0)
-    c = tl.arange(0, 4096)
-    jj = tl.arange(0, NT)
-    acc = tl.zeros([4096], dtype=tl.float32)
-    for k in range(8):
-        p = tl.load(RPOS + t * 8 + k)
-        if p >= 0:
-            ss = tl.sum(tl.load(SSP + p * NT + jj), 0)
-            w = tl.load(WTS + t * 8 + k) * tl.rsqrt(ss / 4096.0 + 1e-8)
-            acc += w * tl.load(Z + p * 4096 + c).to(tl.float32)
-    tl.store(M + t * 4096 + c, acc.to(tl.bfloat16))
 
 
 @triton.jit
@@ -13046,7 +12764,6 @@ def _boundary2(P, S: tl.constexpr, T, NU: tl.constexpr, S1, A2, B2, GPOST, GNEXT
 
 def _marlin_bank(weights):
     """The local experts in Marlin's layout (SGLang's own loader step), as baseline.py builds them."""
-    import types
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
     from sglang.srt.layers.quantization.marlin_utils_fp4 import prepare_moe_nvfp4_layer_for_marlin
     device = weights["w13"].device
@@ -13153,7 +12870,7 @@ def _calib_bias(st, dev, g, log=False):
     gc = torch.Generator(device=dev).manual_seed(987654321)
     h = torch.randn(512, HIDDEN, generator=gc, device=dev)
     h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-5)
-    sc = torch.sigmoid(h.double() @ router.double().T * 0.1767766952966369).float()
+    sc = torch.sigmoid(h.double() @ router.double().T * ROUTER_MULT).float()
     idx = torch.arange(LOCAL_EXPERTS, device=dev).float()
 
     def stats(shape, delta):
@@ -13201,7 +12918,6 @@ def _tune(st, log=False):
     st["gluev2"] = {}
     st["marlin_cfg"] = {}
     st["mm_pick"] = {}
-    pb_ok = {}
     for T in (1, 2, 4, 8, 16, 32, 64, 128, 256):
         data = {"stream": torch.randn(T, HIDDEN, generator=g, device=dev),
                 "local_start": torch.zeros(1, dtype=torch.int32, device=dev)}
@@ -13313,20 +13029,14 @@ def _tune(st, log=False):
             best, bestv2 = DEFAULT_MOE, dfltv2
         st["moe_pick"][T] = best if best is not None else DEFAULT_MOE
         st["gluev2"][T] = bestv2
-        tb = 1e30
         if log:
-            print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
-        pb_ok[T] = tb < bestt
-    pbmax = 0
-    for T in (1, 2, 4, 8, 16, 32):
-        if pb_ok.get(T):
-            pbmax = T
-        else:
-            break
+            print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg), flush=True)
     st["bias"].copy_(bias0)
-    st["pbmax"] = pbmax if FORCE_PBMAX is None else FORCE_PBMAX
+    # The megakernel comparison used to live here; it never won, so pbmax is
+    # always 0 unless FORCE_PBMAX overrides it. The state key is kept.
+    st["pbmax"] = 0 if FORCE_PBMAX is None else FORCE_PBMAX
     if log:
-        print("tune: pbmax", pbmax, "moe", st["moe_pick"], "gluev2", st["gluev2"], flush=True)
+        print("tune: pbmax", st["pbmax"], "moe", st["moe_pick"], "gluev2", st["gluev2"], flush=True)
     del flush
 
 
@@ -13341,9 +13051,8 @@ def prepare(weights):
     st["pr"] = torch.cat([weights["pooler"], hi, lo], 0).contiguous()
     st["unpool"] = weights["unpooler"].contiguous()
     st["unpool_slice"] = weights["unpooler"][:1024].contiguous()
-    # Weight storage, to the letter of TASK.md: every BF16 checkpoint weight stays BF16. The norms are
-    # applied as (1 + w), which my kernels now form in FP32 at use; the one tensor SGLang itself
-    # precomputes (the post-expert effective weight) is stored exactly as SGLang stores it, in BF16.
+    # Every BF16 checkpoint weight stays BF16. Norms apply (1 + w), formed in
+    # FP32 at use; the post-expert weight is stored as SGLang stores it.
     st["gate1"] = weights["attn_residual_gate"].contiguous()
     st["gate2"] = weights["ffn_residual_gate"].contiguous()
     st["g_preffn"] = weights["pre_ffn_norm"].contiguous()
@@ -13359,8 +13068,7 @@ def prepare(weights):
     st["w2s"] = _repack_s(weights["w2_sf"].view(torch.uint8), False)
     st["gs2"] = weights["w2_gs"].float().contiguous()
     st["invf0"] = torch.zeros(32, device=dev)
-    st["invf"] = (1.0 / (500000.0 ** (torch.arange(0, 64, 2, device=dev).float() / 64))).contiguous()
-    import threading
+    st["invf"] = (1.0 / (ROPE_THETA ** (torch.arange(0, HEAD_DIM, 2, device=dev).float() / HEAD_DIM))).contiguous()
     errs = []
 
     def _build(fn):
@@ -13420,18 +13128,18 @@ def _attn_cfg(B, L, sliding):
     return BM, nsplit
 
 
-_INV_FREQ7 = {}
+_INV_FREQ_CACHE = {}
 
 
-def _inv_freq7(theta, device):
+def _inv_freq(theta, device):
     key = (float(theta), str(device))
-    t = _INV_FREQ7.get(key)
+    t = _INV_FREQ_CACHE.get(key)
     if t is None:
         if theta:
             t = 1.0 / (theta ** (torch.arange(0, 64, 2, device=device).float() / 64))
         else:
             t = torch.zeros(32, device=device)
-        _INV_FREQ7[key] = t.float().contiguous()
+        _INV_FREQ_CACHE[key] = t.float().contiguous()
     return t
 
 
@@ -13481,7 +13189,7 @@ def _launch7(data, dbg=None, _mod=None, pdl=None, **override):
     scratch, bar = _cluster_bufs7(n_ctas if cs > 1 else 1, L, device)
     scale_log2 = cfg["sm_scale"] * cfg["qk_scale_factor"] * LOG2E
     (_mod or _att7()).run(qkv, data["seq_lens"], data["cache_loc"], data["k_cache"], data["v_cache"], page_table,
-                  data["k_scale"], data["v_scale"], _inv_freq7(cfg["rope_theta"], device), out, ws_acc, ws_l,
+                  data["k_scale"], data["v_scale"], _inv_freq(cfg["rope_theta"], device), out, ws_acc, ws_l,
                   ws_cnt, B, L, hq, hkv, P, window, 1 if cfg["rope_theta"] else 0, n_splits, flat, nc, scale_log2,
                   dbg, cs, ncl, scratch, bar, tma)
     return out
@@ -13505,7 +13213,7 @@ def _decode_attention7(data, state, qkv):
     out = _launch7({"config": cfg, "qkv": qkv, "seq_lens": data["seq_lens"], "cache_loc": data["cache_loc"],
                     "k_cache": data["k_cache"], "v_cache": data["v_cache"], "page_table": data["page_table"],
                     "k_scale": data["k_scale"], "v_scale": data["v_scale"]}, **pdl)
-    return out.view(cfg["batch"] * cfg["q_len"], 1024)
+    return out.view(cfg["batch"] * cfg["q_len"], Q_DIM)
 
 
 # Guards around every component buffer this glue allocates or caches (POD.md item 6 follow-up): the moe
@@ -13535,25 +13243,6 @@ def _check_guards():
             raise RuntimeError(f"a component kernel wrote {bad} words past a {words * 4}-byte buffer")
 
 
-_workspace7_raw, _cluster_bufs7_raw = _workspace7, _cluster_bufs7
-
-
-def _workspace7(n_rows, device):          # their allocator, then guard whatever it newly allocated
-    ws = _workspace7_raw(n_rows, device)
-    if id(ws[0]) not in _GUARDED_IDS:
-        ws = tuple(_guarded(t) for t in ws)
-        _WS7[str(device)] = ws
-    return ws
-
-
-def _cluster_bufs7(n_ctas, L, device):
-    cb = _cluster_bufs7_raw(n_ctas, L, device)
-    if id(cb[0]) not in _GUARDED_IDS:
-        cb = tuple(_guarded(t) for t in cb)
-        _CL7[str(device)] = cb
-    return cb
-
-
 def _attn_selftest(st):
     """Run the attention kernel once per plan family on synthetic inputs (problem constants, no data), so its
     lazily allocated buffers exist and are guarded before any timed call, and the guards see every path."""
@@ -13564,8 +13253,8 @@ def _attn_selftest(st):
                                  (0, 1, 1, 3000, 1), (0, 1, 16, 1500, 1), (0, 1, 33, 1000, 1),
                                  (0, 8, 1, 3000, 1), (0, 8, 16, 1500, 1), (0, 8, 32, 800, 1),
                                  (2048, 1, 4, 3000, 64), (0, 8, 4, 3000, 64)):
-        cfg = dict(batch=B, q_len=L, num_q_heads=16, num_kv_heads=2, head_dim=64, page_size=P, window=window,
-                   rope_theta=500000.0 if window else 0.0, qk_scale_factor=5.4730064863875, sm_scale=0.125)
+        cfg = dict(batch=B, q_len=L, num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM, page_size=P, window=window,
+                   rope_theta=ROPE_THETA if window else 0.0, qk_scale_factor=5.4730064863875, sm_scale=0.125)
         if not _supported7(cfg):
             continue
         seq = torch.full((B,), ctx, dtype=torch.int32, device=dev)
@@ -13587,7 +13276,7 @@ def _att_fits7(data, cfg):
     rows = kc.numel() // max(1, cfg["num_kv_heads"] * cfg["head_dim"])
     return (kc.numel() < (1 << 32) and vc.numel() < (1 << 32) and rows < (1 << 31)
             and data["page_table"].numel() < (1 << 31)
-            and cfg["batch"] * cfg["q_len"] * 2304 < (1 << 31)
+            and cfg["batch"] * cfg["q_len"] * QKV_ROWS < (1 << 31)
             and cfg["batch"] * (cfg["num_kv_heads"] // 2) <= 4096)
 
 
@@ -13605,8 +13294,7 @@ def kernel_fn(data, state):
     # q_len 8: their kernel on full layers, and on sliding only for a single request, where fusing QK-norm, RoPE,
     # the cache write and the norm-gate into one launch beats FA3 + my two glue kernels by 5.6% in-layer;
     # at B >= 16 sliding FA3 still matches or wins (16x8 -1.2%, 32x8 +0.8%), below my 4% bar for q_len 8.
-    agent_attn = (state["att_ok"] and _supported7(cfg) and _att_fits7(data, cfg)
-                 )
+    agent_attn = state["att_ok"] and _supported7(cfg) and _att_fits7(data, cfg)
     if agent_attn:
         # fused decode attention (QK-norm, RoPE, cache write, split-KV, merge, rmsnorm * sigmoid(gate))
         qpick = state.get("mm_pick", {}).get((T, "qkv"), True)
@@ -13630,8 +13318,8 @@ def kernel_fn(data, state):
     use_fa3 = state["fa3"] is not None
     # 1. qkv projection, QK-norm, RoPE, FP8 cache write
     P, S = dense(x, state["qkv"], T)
-    q = torch.empty((T, 1024), device=dev, dtype=torch.bfloat16)
-    q8 = torch.empty((T, 1024), device=dev, dtype=torch.uint8)
+    q = torch.empty((T, Q_DIM), device=dev, dtype=torch.bfloat16)
+    q8 = torch.empty((T, Q_DIM), device=dev, dtype=torch.uint8)
     gate = torch.empty((T, 1024), device=dev, dtype=torch.float32)
     kc = data["k_cache"].view(torch.uint8)
     vc = data["v_cache"].view(torch.uint8)
@@ -13662,10 +13350,24 @@ def kernel_fn(data, state):
         _attn_split[(B, NS)](q, kc, vc, pt, data["seq_lens"], data["k_scale"], acc, ml,
                              pt.stride(0), cfg["page_size"], cfg["window"], cfg["sm_scale"],
                              L=L, NSPLIT=NS, BM=BM, BN=64, SLIDING=sliding, num_warps=4, num_stages=3)
-        o_in = torch.empty((T, 1024), device=dev, dtype=torch.bfloat16)
+        o_in = torch.empty((T, Q_DIM), device=dev, dtype=torch.bfloat16)
         _attn_combine[(T, 16)](acc, ml, gate, data["v_scale"], o_in, L=L, NSPLIT=NS, BM=BM,
                                SB=min(64, triton.next_power_of_2(NS)), NORMGATE=False, num_warps=4)
     return _after_attention(data, state, o_in, gate, T)
+
+
+def _pick_expert_backend(pick, marlin_available, agent_available):
+    """The expert-backend fallback, factored out of _after_attention: Marlin
+    without its bank falls back to the agent kernel, and vice versa. The
+    three steps are kept in order (not a loop): when neither backend is
+    available the original code terminates with "agent", and so does this."""
+    if pick == "marlin" and not marlin_available:
+        pick = "agent"
+    if pick != "marlin" and not agent_available:
+        pick = "marlin"
+    if pick == "marlin" and not marlin_available:
+        pick = "agent"
+    return pick
 
 
 def _after_attention(data, state, o_in, gate, T):
@@ -13712,13 +13414,8 @@ def _after_attention(data, state, o_in, gate, T):
     ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
     lids = torch.empty((T, 8), device=dev, dtype=torch.int32)
     wts = torch.empty((T, 8), **f32)
-    moe = state["moe_pick"].get(T, state["moe_pick"].get(_bucket(T), "agent"))
-    if moe == "marlin" and state["bank"] is None:
-        moe = "agent"
-    if moe != "marlin" and not state["ma_ok"]:
-        moe = "marlin"
-    if moe == "marlin" and state["bank"] is None:
-        moe = "agent"
+    moe = _pick_expert_backend(state["moe_pick"].get(T, state["moe_pick"].get(_bucket(T), "agent")),
+                               marlin_available=state["bank"] is not None, agent_available=state["ma_ok"])
     use_marlin = moe == "marlin"
     use_ma = moe == "agent"
     if not (use_marlin or use_ma):

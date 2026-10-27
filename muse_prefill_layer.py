@@ -1,7 +1,68 @@
 # okc: problem=muse_prefill_layer
-"""Muse Spark prefill layer: cuBLAS dense GEMMs, FA3 FP8 attention, fused Triton kernels for the
-norms/RoPE/cache store/routing/combine, and a Hopper grouped expert GEMM (NVFP4 weights dequantized
-in registers as the wgmma A operand, BF16 activations from shared memory, fused SiLU*up epilogue)."""
+"""Muse Spark prefill layer: one transformer layer step over a batch of tokens.
+
+Algorithm (one ``kernel_fn`` call, in order; every stage is one launch or a
+few launches, and the stage order is the data dependency order):
+
+1. **QKV projection.** Dense GEMM (cuBLASLt-tuned, else ``torch.mm``) of the
+   attention input, producing ``[Q | K | V | gate]`` per token.
+2. **Q/K prep.** Per-token RMS-norm of Q and K, RoPE rotation, FP8
+   (E4M3) quantisation of Q, and stores of K/V into the paged KV cache,
+   scaled by the cache scales. A CUDA kernel (``qk_prep``) does this; the
+   Triton ``_qk_prep_kernel`` is the same computation and is kept as the
+   fallback path.
+3. **Attention.** Either the FA3 paged FP8 path followed by a fused
+   ``norm * sigmoid(gate)`` epilogue, or the file's own Hopper attention
+   kernel (``attn_fwd``) with that epilogue fused in. The own kernel is
+   picked per shape class in ``prepare`` after validating it against the
+   FA3 path. On non-Hopper devices a slow FP32 reference attention runs
+   instead (testing only, never on the scored path).
+4. **O projection + first boundary.** Dense GEMM, then the boundary mixes
+   the branch into the fp32 residual stream:
+   ``stream = alpha * stream + beta * rms(branch)`` and emits the next
+   block's BF16 input as ``rms(stream) * (1 + g_pre)``. The boundary
+   kernels also zero the MoE work-counters as a side effect.
+5. **Router + pooler, overlapped.** The router GEMM and top-8 routing run
+   on a side stream while the pooler GEMM runs on the main stream; the
+   main stream then joins the side stream. Routing picks ``TOP_K`` experts
+   per token, per local expert.
+6. **Grouped MoE.** The pooler output is gathered (with the pre-expert
+   norm) into per-expert token rows, then the fused persistent kernel
+   runs both expert GEMMs: NVFP4 weights are dequantised in registers as
+   the wgmma A-operand, BF16 activations come from shared memory, and
+   the epilogue is the fused SiLU*up (``silu(gate) * up``) for GEMM1.
+7. **Combine + unpooler + second boundary.** The per-route rows are
+   combined (per-expert RMS-norm, weighted by routing weights) back into
+   one ``[T, D_EXPERT]`` tensor, the unpooler GEMM brings it back to
+   ``HIDDEN``, and the second boundary mixes it into the stream and
+   emits the layer output. When the token count is large the second
+   boundary instead rebuilds the fp32 stream from the first boundary's
+   saved RMS factor, saving a 32 KB-per-row round trip.
+
+Design rules this file follows:
+
+* ``prepare(weights)`` runs once: it builds the CUDA extension, repacks
+  the NVFP4 expert weights into the kernel's layout, and tunes the two
+  choices that depend on the machine (cuBLASLt algorithm per dense GEMM,
+  own-attention variant per shape class). Those tuning results are the
+  only state carried between calls, plus the compiled extension and one
+  side stream.
+* ``kernel_fn(data, state)`` allocates every activation fresh on every
+  call and returns fresh tensors; nothing computed from one call's
+  inputs is reused by another.
+* The timed path performs no host synchronisation: no ``.item()``,
+  ``.tolist()``, ``torch.cuda.synchronize()`` or data-dependent host
+  branch. (The FP32 fallback attention and the self-tests do sync; they
+  are not on the Hopper path.)
+* The CUDA/C++ sources at the bottom (``CPP``, ``GLUE``, ``_CUDA_SRC``,
+  ``LT_CPP``, ``LT_GLUE``) are byte-identical to the submitted version:
+  the kernels, tile sizes and launch configs are the tuned algorithm,
+  and retyping them would risk silent divergence. Everything above
+  them -- constants, Triton kernels, ``prepare``, ``kernel_fn`` and the
+  helpers -- is the refactored Python layer. Anything in that layer
+  whose equivalence is not provable from the source alone is flagged
+  in ``muse_prefill_layer_REFACTOR_NOTES.md`` as needing GPU gating.
+"""
 
 import hashlib
 
@@ -12,38 +73,151 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-HIDDEN = 8192
-D_EXPERT = 4096
-N_EXPERTS = 256
-TOP_K = 8
-LOCAL_EXPERTS = 32
-HQ, HKV, HD = 16, 2, 64
-Q_SIZE, KV_SIZE = HQ * HD, HKV * HD
-QKV_SIZE = 2 * Q_SIZE + 2 * KV_SIZE
-RMS_EPS = 1e-5
-POST_NORM_EPS = 1e-8
-ROUTER_MULT = 0.1767766952966369
-ROPE_THETA = 500_000.0
-FP8 = torch.float8_e4m3fn
-P_GEMM1 = 8  # tile slots per weight n-tile in the (non-persistent) expert GEMMs
-P_GEMM2 = 16
-# expert GEMM launch mode per token count: "fused" (both GEMMs in one persistent launch), "persist" (two persistent
-# launches), "p816" (two per-tile-grid launches with P_GEMM1/P_GEMM2 slots)
-MOE_LARGE_T = 8192
-MOE_MODE_SMALL = "fused"
-MOE_MODE_LARGE = "fused"
-# tile order for the persistent work queue: 0 expert order, 1 biggest first, 2 big first + small tiles spread between
-MOE_ORDER_SMALL = 1  # 3: expert groups walked n-tile-major (weights shared through L2)
-MOE_ORDER_LARGE = 1
-
 try:  # FA3 (Hopper) from the judge image
     from sgl_kernel.flash_attn import flash_attn_with_kvcache as _fa3
 except Exception:  # local testing
     _fa3 = None
 
-# ----------------------------------------------------------------------------------------------
-# Triton kernels
-# ----------------------------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
+# Model geometry. Every other size in the file derives from these.
+# --------------------------------------------------------------------------------------
+
+HIDDEN = 8192
+D_EXPERT = 4096
+TOP_K = 8
+LOCAL_EXPERTS = 32
+HQ, HKV, HD = 16, 2, 64
+Q_SIZE, KV_SIZE = HQ * HD, HKV * HD
+# QKV gate output per token: [Q (Q_SIZE) | K (KV_SIZE) | V (KV_SIZE) | gate (Q_SIZE)].
+QKV_SIZE = 2 * Q_SIZE + 2 * KV_SIZE
+GATE_OFFSET = Q_SIZE + 2 * KV_SIZE  # gate starts after Q, K, V
+RMS_EPS = 1e-5  # RMS-norm epsilon (post-norm and Q/K-norm; the CUDA kernels use the same)
+POST_NORM_EPS = 1e-8  # boundary / combine RMS-norm epsilon (the CUDA kernels use the same)
+ROPE_THETA = 500_000.0
+FP8 = torch.float8_e4m3fn
+LOG2E = 1.4426950408889634  # converts a natural-log softmax scale for exp2
+
+# NVFP4 expert weights: K is walked in stages of KS elements; each
+# (n-tile, k-stage) weight block holds KS * 128 code bytes + KS * 8 scale bytes.
+KS, WBLK = 64, 4608
+
+
+# --------------------------------------------------------------------------------------
+# Tuning knobs. Each one is a measured default, not a guess: the comment says
+# what it changes and why the value is what it is. All of them were formerly
+# scattered through the file (several after their first use); they are
+# collected here so the whole launch configuration is visible at once.
+# --------------------------------------------------------------------------------------
+
+# --- MoE launch ---
+# Tile slots per weight n-tile in the (non-persistent) expert GEMMs.
+P_GEMM1 = 8
+P_GEMM2 = 16
+MOE_LARGE_T = 8192  # token count from which the "large" launch mode/order apply
+# Launch mode per token count: "fused" = both GEMMs in one persistent launch,
+# "persist" = two persistent launches, anything else = two per-tile-grid launches.
+MOE_MODE_SMALL = "fused"
+MOE_MODE_LARGE = "fused"
+# Tile order for the persistent work queue: 0 expert order, 1 biggest first,
+# 2 big first + small tiles spread between.
+MOE_ORDER_SMALL = 1
+MOE_ORDER_LARGE = 1
+MOE_FINE_ORDER_SHIFT = 8  # bit 8 of the plan order / fused flags: fine remainder tiles
+MIN_TILE_ROWS = 32  # smallest token tile; the plan's tile-count bound divides by this
+MOE_TILE_SLACK = 64  # extra tile slots in the plan buffer, beyond the bound
+MAX_PADDED_ROWS_PER_EXPERT = 256  # per-expert row allowance in the padded row buffer
+FINE_MIN_T = 2048  # from this token count, remainder tiles round to 32 rows
+SKINNY_TEST = False  # feasibility-test build: the fused MoE kernel at 2 CTAs/SM
+CIT = False  # combine in the tail of the fused expert kernel (no combine launch)
+GATHER_PLAN = True  # the gather kernel also writes the plan (one launch fewer)
+MOE_SMEM_SM90 = 227 * 1024  # dynamic shared memory for the fused/persistent MoE kernels
+MOE_SMEM_SM80 = 163 * 1024
+MOE_SMEM_SKINNY_TEST = 100 * 1024
+
+# --- Boundary ---
+BND_RECOMPUTE = True  # second boundary rebuilds the fp32 stream from the first's RMS factor
+BND_RC_MIN_T = 8192  # ...from this token count (below it, the stored stream is cheaper)
+BND_CUDA_MIN = 1  # token count from which the CUDA boundary kernel replaces the Triton one
+
+# --- Router / combine ---
+ROUTER_SERIAL_MAX = 0  # T <= this: router GEMM on the main stream before the pooler
+ROUTER_SERIAL_MIN = 1 << 30  # T >= this: the same (never, at the scored sizes)
+ROUTER_LT = True  # False: the router GEMM always runs as torch.mm (no tuned split-K algorithm)
+COMBINE_NW_SMALL = 8  # Triton combine warps at T <= COMBINE_SMALL_T
+COMBINE_SMALL_T = 4096
+COMBINE_PW_EARLY = tl.constexpr(False)  # Triton combine: norm weight loaded before the PDL wait
+CUDA_COMBINE = False  # CUDA combine kernel (PDL): slower than Triton at the scored sizes
+TRITON_PDL = False  # qk_prep and combine (Triton) launched with programmatic dependent launch
+
+# --- Attention ---
+QK_PREP_CUDA = True  # CUDA q/k prep instead of the Triton kernel (same numerics)
+PREP_SPLIT_MAX_T = 1024  # stage cache-only attention tiles on the side stream during the qkv GEMM
+PREP_SPLIT = {"slide": False, "full": False}  # split-staging by shape class (off: it cost time)
+PREP_SPLIT_AFTER = True  # capture the side branch after the qkv GEMM node, not before it
+ATTN_SK = {"slide": 0, "full_long": 0, "full_short": 0, "full_batch": 0}  # stream-K grid per class (0: off)
+ATTN_SK_MAX_PAIRS = 1536  # stream-K applies only up to this many (block, pair) pairs; must match ATTN_SK_MAXPAIRS in _CUDA_SRC
+ATTN_PF_MAX_T = 0  # tokens <= this: the attention kernel prefetches the o-proj weight into L2 (0: off)
+ATTN_SPLIT_MODE = 1  # 0: fill two waves; 1: minimize waves / splits (wave-quantization aware)
+# Own attention variant per shape class when it validates (None: time all variants
+# in prepare). Variant 43 is ~4% faster than 8 on long full attention and ~3%
+# slower on sliding windows, hence the split by class.
+ATTN_FIXED = {"slide": 8, "full_long": 43, "full_short": 43, "full_batch": 43}
+# Own-kernel variants: (consumer warpgroups, exponentials per thread per tile on
+# the FMA pipe). The first element sizes the split heuristic; the GLUE launch
+# table maps the variant to the kernel template parameters.
+ATTN_VARIANTS = {0: (2, 0), 1: (2, 16), 8: (3, 0), 9: (3, 16), 16: (2, 0), 24: (3, 0), 43: (3, 0)}
+OWN_ATTN_LOCAL = False  # local (sm_80) runs use the FP32 fallback attention unless set
+ATTN_ASTAGES = 4  # must match `#define ATTN_ASTAGES` in _CUDA_SRC (it sets the staging depth)
+# Dynamic shared memory for the own attention kernel: Q/K staging + per-stage
+# K/V tiles (a K tile is 128 keys x 64, a V tile 72 x 128). Must match the
+# kernel's staging in _CUDA_SRC.
+ATTN_SMEM = 1024 + 1024 + 4096 * 3 + ATTN_ASTAGES * (8192 + 72 * 128)
+ATTN_SMEM_SM80_EXTRA = 3 * 64 * 128  # sm_80 test path stages P in shared memory
+ATTN_VALIDATE_TOL = 0.03  # max relative error for an own-kernel variant to validate
+ATTN_Q_ROWS_PER_WARPGROUP = 8  # query rows one warpgroup owns in the split heuristic
+ATTN_KEY_TILE = 128  # keys per staging tile
+ATTN_MAX_SPLITS = 16  # cap on attention key-range splits
+ATTN_SPLIT_PENALTY = 0.02  # cost added per extra split (the merge pass is not free)
+ATTN_SPLIT_SLOT = HD + 2  # per (split, token, head) partial: 64 unnormalised O + max + sum
+ATTN_SK_Q_BLOCK = 24  # stream-K: query rows per (block, pair) -- 3 warpgroups x 8 rows
+FALLBACK_Q_BLOCK = 1024  # query rows per step in the FP32 fallback attention
+
+# --- Dense GEMMs (cuBLASLt) ---
+# name -> (state weight [N, K], fp32 output). The router GEMM returns both
+# halves (hi | lo partial logits) in one GEMM.
+LT_GEMMS = {"qkv": ("qkv_gate", False), "o": ("o", False), "router": ("router_hilo", True),
+            "pooler": ("pooler", False), "unpooler": ("unpooler", False)}
+LT_TOKENS = (753, 3012, 16384)  # token counts of the scored shapes; others use torch.mm
+# T -> SMs left free for the router chain by sizing the pooler down (0/absent:
+# torch.mm or the tuned algorithm). The router chain runs on a side stream
+# during the pooler GEMM; at small T the pooler holds every SM, so the chain
+# would wait for the pooler's end and land the top-8 on the critical path.
+POOL_SM_RESERVE = {}
+# (T, gemm) -> cuBLASLt heuristic signature (tile id, split-K, reduction,
+# custom option): a fixed pick, so prepare never races near-equal algorithms.
+LT_PIN = {(753, "router"): (33, 4, 2, 3), (16384, "o"): (201, 1, 0, 2),
+          (16384, "unpooler"): (201, 1, 0, 2), (16384, "pooler"): (29, 1, 0, 1)}
+LT_ALGO_TOL = 2e-2  # a tuned algorithm must match torch.mm this closely to be kept
+LT_MIN_SPEEDUP = 0.97  # ...and must beat torch.mm by at least this factor to be kept
+LT_WORKSPACE_BYTES = 64 << 20  # cuBLASLt workspace per stream (main + side)
+
+# --- Self-tests (check runs only, printed from prepare) ---
+SELFTEST = False
+SYNTH_SM_SCALE = 0.125  # 1 / sqrt(HD), the softmax scale of the synthetic attention cases
+SYNTH_QK_SCALE_FACTOR = 5.4730064863875  # qk scale factor of the synthetic attention cases
+
+# The side stream for the router GEMM + top-8 (created in prepare). It is a
+# module global, not part of the state dict, because the state holds only
+# tensors and plain data.
+SIDE_STREAM = None
+
+# --------------------------------------------------------------------------------------
+# Triton kernels. The CUDA kernels in _CUDA_SRC do the same jobs on the hot
+# paths; these cover the boundary/combine epilogues and the q/k prep
+# fallback. Shapes here are spelled with the model constants: a QKV row is
+# [Q | K | V | gate], so the gate starts at GATE_OFFSET.
+# --------------------------------------------------------------------------------------
 
 
 @triton.jit
@@ -60,33 +234,24 @@ def _to_e4m3(x):
 
 
 @triton.jit
-def _e4m3_to_f32(b):
-    """float8_e4m3fn bits (int32 0..255) -> fp32, exact."""
-    e = (b >> 3) & 15
-    normal = (((b & 0x7F) << 20) + (120 << 23)).to(tl.float32, bitcast=True)
-    sub = (b & 7).to(tl.float32) * 0.001953125
-    v = tl.where(e == 0, sub, normal)
-    return tl.where((b & 0x80) != 0, -v, v)
-
-@triton.jit
 def _qk_prep_kernel(qkv_ptr, pos_ptr, loc_ptr, invf_ptr, q8_ptr, kc_ptr, vc_ptr, ksc_ptr, vsc_ptr,
-                    ROPE: tl.constexpr, SCALED: tl.constexpr, PDL: tl.constexpr = False):
+                     ROPE: tl.constexpr, SCALED: tl.constexpr, PDL: tl.constexpr = False):
     if PDL:  # programmatic dependent launch: let the successor launch, wait for the predecessor's results
         tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
     t = tl.program_id(0)
-    row = qkv_ptr + t.to(tl.int64) * 2304
-    h = tl.arange(0, 16)[:, None]
-    i = tl.arange(0, 32)[None, :]
-    qe = tl.load(row + h * 64 + 2 * i).to(tl.float32)
-    qo = tl.load(row + h * 64 + 2 * i + 1).to(tl.float32)
-    rq = tl.rsqrt((tl.sum(qe * qe, 1) + tl.sum(qo * qo, 1)) / 64.0 + 1e-5)[:, None]
+    row = qkv_ptr + t.to(tl.int64) * 2304  # Triton does not capture plain-int module globals
+    h = tl.arange(0, 16)[:, None]  # Triton does not capture plain-int module globals
+    i = tl.arange(0, 32)[None, :]  # Triton does not capture plain-int module globals
+    qe = tl.load(row + h * 64 + 2 * i).to(tl.float32)  # Triton does not capture plain-int module globals
+    qo = tl.load(row + h * 64 + 2 * i + 1).to(tl.float32)  # Triton does not capture plain-int module globals
+    rq = tl.rsqrt((tl.sum(qe * qe, 1) + tl.sum(qo * qo, 1)) / 64.0 + 1e-5)[:, None]  # Triton does not capture plain-int module globals
     qe = qe * rq
     qo = qo * rq
-    kh = tl.arange(0, 2)[:, None]
-    ke = tl.load(row + 1024 + kh * 64 + 2 * i).to(tl.float32)
-    ko = tl.load(row + 1024 + kh * 64 + 2 * i + 1).to(tl.float32)
-    rk = tl.rsqrt((tl.sum(ke * ke, 1) + tl.sum(ko * ko, 1)) / 64.0 + 1e-5)[:, None]
+    kh = tl.arange(0, 2)[:, None]  # Triton does not capture plain-int module globals
+    ke = tl.load(row + 1024 + kh * 64 + 2 * i).to(tl.float32)  # Triton does not capture plain-int module globals
+    ko = tl.load(row + 1024 + kh * 64 + 2 * i + 1).to(tl.float32)  # Triton does not capture plain-int module globals
+    rk = tl.rsqrt((tl.sum(ke * ke, 1) + tl.sum(ko * ko, 1)) / 64.0 + 1e-5)[:, None]  # Triton does not capture plain-int module globals
     ke = ke * rk
     ko = ko * rk
     if ROPE:
@@ -96,33 +261,33 @@ def _qk_prep_kernel(qkv_ptr, pos_ptr, loc_ptr, invf_ptr, q8_ptr, kc_ptr, vc_ptr,
         s = libdevice.sin(ang)
         qe, qo = qe * c - qo * s, qe * s + qo * c
         ke, ko = ke * c - ko * s, ke * s + ko * c
-    qrow = q8_ptr + t.to(tl.int64) * 1024
-    tl.store(qrow + h * 64 + 2 * i, _to_e4m3(qe))
-    tl.store(qrow + h * 64 + 2 * i + 1, _to_e4m3(qo))
+    qrow = q8_ptr + t.to(tl.int64) * 1024  # Triton does not capture plain-int module globals
+    tl.store(qrow + h * 64 + 2 * i, _to_e4m3(qe))  # Triton does not capture plain-int module globals
+    tl.store(qrow + h * 64 + 2 * i + 1, _to_e4m3(qo))  # Triton does not capture plain-int module globals
     loc = tl.load(loc_ptr + t).to(tl.int64)
-    j = tl.arange(0, 64)[None, :]
-    v = tl.load(row + 1152 + kh * 64 + j).to(tl.float32)
+    j = tl.arange(0, 64)[None, :]  # Triton does not capture plain-int module globals
+    v = tl.load(row + 1152 + kh * 64 + j).to(tl.float32)  # Triton does not capture plain-int module globals
     if SCALED:
         ks = tl.load(ksc_ptr)
         vs = tl.load(vsc_ptr)
         ke = ke / ks
         ko = ko / ks
         v = v / vs
-    tl.store(kc_ptr + loc * 128 + kh * 64 + 2 * i, _to_e4m3(ke))
-    tl.store(kc_ptr + loc * 128 + kh * 64 + 2 * i + 1, _to_e4m3(ko))
-    tl.store(vc_ptr + loc * 128 + kh * 64 + j, _to_e4m3(v))
+    tl.store(kc_ptr + loc * 128 + kh * 64 + 2 * i, _to_e4m3(ke))  # Triton does not capture plain-int module globals
+    tl.store(kc_ptr + loc * 128 + kh * 64 + 2 * i + 1, _to_e4m3(ko))  # Triton does not capture plain-int module globals
+    tl.store(vc_ptr + loc * 128 + kh * 64 + j, _to_e4m3(v))  # Triton does not capture plain-int module globals
 
 
 @triton.jit
 def _norm_gate_kernel(o_ptr, qkv_ptr, out_ptr):
     t = tl.program_id(0)
-    h = tl.arange(0, 16)[:, None]
-    j = tl.arange(0, 64)[None, :]
-    o = tl.load(o_ptr + t.to(tl.int64) * 1024 + h * 64 + j).to(tl.float32)
-    g = tl.load(qkv_ptr + t.to(tl.int64) * 2304 + 1280 + h * 64 + j).to(tl.float32)
-    r = tl.rsqrt(tl.sum(o * o, 1) / 64.0 + 1e-5)[:, None]
+    h = tl.arange(0, 16)[:, None]  # Triton does not capture plain-int module globals
+    j = tl.arange(0, 64)[None, :]  # Triton does not capture plain-int module globals
+    o = tl.load(o_ptr + t.to(tl.int64) * 1024 + h * 64 + j).to(tl.float32)  # Triton does not capture plain-int module globals
+    g = tl.load(qkv_ptr + t.to(tl.int64) * 2304 + 1280 + h * 64 + j).to(tl.float32)  # Triton does not capture plain-int module globals
+    r = tl.rsqrt(tl.sum(o * o, 1) / 64.0 + 1e-5)[:, None]  # Triton does not capture plain-int module globals
     y = o * r * tl.sigmoid(g)
-    tl.store(out_ptr + t.to(tl.int64) * 1024 + h * 64 + j, y.to(tl.bfloat16))
+    tl.store(out_ptr + t.to(tl.int64) * 1024 + h * 64 + j, y.to(tl.bfloat16))  # Triton does not capture plain-int module globals
 
 
 @triton.jit
@@ -134,60 +299,12 @@ def _boundary_kernel(branch_ptr, stream_ptr, gpost_ptr, alpha_ptr, beta_ptr, gpr
     b = tl.load(branch_ptr + base + offs).to(tl.float32)
     if HAS_GPOST:
         b = b * (1.0 + tl.load(gpost_ptr + offs).to(tl.float32))
-    r1 = tl.rsqrt(tl.sum(b * b, 0) / H + 1e-8)
+    r1 = tl.rsqrt(tl.sum(b * b, 0) / H + 1e-8)  # Triton does not capture plain-int module globals
     s = tl.load(alpha_ptr + offs) * tl.load(stream_ptr + base + offs) + tl.load(beta_ptr + offs) * (b * r1)
     if STORE_S:
         tl.store(sout_ptr + base + offs, s)
-    r2 = tl.rsqrt(tl.sum(s * s, 0) / H + 1e-5)
+    r2 = tl.rsqrt(tl.sum(s * s, 0) / H + 1e-5)  # Triton does not capture plain-int module globals
     tl.store(nout_ptr + base + offs, (s * r2 * (1.0 + tl.load(gpre_ptr + offs).to(tl.float32))).to(tl.bfloat16))
-
-
-@triton.jit
-def _boundary2_kernel(a_ptr, stream_ptr, f_ptr, a1_ptr, b1_ptr, gpost_ptr, a2_ptr, b2_ptr, gnext_ptr, sout_ptr, nout_ptr,
-                      H: tl.constexpr):
-    """Layer-end boundary that recomputes the attention boundary's stream (alpha1*stream + beta1*norm(a)) instead of
-    reading it back: 2 bytes/element less traffic than storing and reloading it in fp32."""
-    t = tl.program_id(0)
-    offs = tl.arange(0, H)
-    base = t.to(tl.int64) * H
-    a = tl.load(a_ptr + base + offs).to(tl.float32)
-    ra = tl.rsqrt(tl.sum(a * a, 0) / H + 1e-8)
-    s1 = tl.load(a1_ptr + offs) * tl.load(stream_ptr + base + offs) + tl.load(b1_ptr + offs) * (a * ra)
-    b = tl.load(f_ptr + base + offs).to(tl.float32) * (1.0 + tl.load(gpost_ptr + offs).to(tl.float32))
-    rb = tl.rsqrt(tl.sum(b * b, 0) / H + 1e-8)
-    s = tl.load(a2_ptr + offs) * s1 + tl.load(b2_ptr + offs) * (b * rb)
-    tl.store(sout_ptr + base + offs, s)
-    r2 = tl.rsqrt(tl.sum(s * s, 0) / H + 1e-5)
-    tl.store(nout_ptr + base + offs, (s * r2 * (1.0 + tl.load(gnext_ptr + offs).to(tl.float32))).to(tl.bfloat16))
-
-
-@triton.jit
-def _route_kernel(logit_ptr, bias_ptr, lstart_ptr, ids_ptr, w_ptr, lid_ptr, pos_ptr, cnt_ptr):
-    t = tl.program_id(0)
-    e = tl.arange(0, 256)
-    lg = tl.load(logit_ptr + t.to(tl.int64) * 512 + e) + tl.load(logit_ptr + t.to(tl.int64) * 512 + 256 + e)
-    s = tl.sigmoid(lg * 0.1767766952966369)
-    b = s + tl.load(bias_ptr + e)
-    ls = tl.load(lstart_ptr)
-    k8 = tl.arange(0, 8)
-    ids = tl.zeros([8], dtype=tl.int32)
-    sel = tl.zeros([8], dtype=tl.float32)
-    for k in tl.static_range(8):
-        m = tl.max(b, 0)
-        idx = tl.min(tl.where(b == m, e, 256), 0)
-        sk = tl.sum(tl.where(e == idx, s, 0.0), 0)
-        ids = tl.where(k8 == k, idx, ids)
-        sel = tl.where(k8 == k, sk, sel)
-        b = tl.where(e == idx, -float("inf"), b)
-    w = sel / (tl.sum(sel, 0) + 1e-15)
-    tl.store(ids_ptr + t * 8 + k8, ids)
-    tl.store(w_ptr + t * 8 + k8, w)
-    loc = (ids - ls + 256) % 256
-    is_local = loc < 32
-    lid = tl.where(is_local, loc, -1)
-    pos = tl.atomic_add(cnt_ptr + loc, tl.full([8], 1, tl.int32), mask=is_local)
-    tl.store(lid_ptr + t * 8 + k8, lid)
-    tl.store(pos_ptr + t * 8 + k8, tl.where(is_local, pos, 0))
 
 
 @triton.jit
@@ -202,48 +319,62 @@ def _combine_kernel(y_ptr, rrow_ptr, lid_ptr, w_ptr, gs_ptr, pw_ptr, out_ptr, H:
     if not COMBINE_PW_EARLY:
         pw = 1.0 + tl.load(pw_ptr + offs).to(tl.float32)  # BF16 weight, applied as 1 + w
     acc = tl.zeros([H], dtype=tl.float32)
-    for k in tl.static_range(8):
-        lid = tl.load(lid_ptr + t * 8 + k)
+    for k in tl.static_range(8):  # Triton does not capture plain-int module globals
+        lid = tl.load(lid_ptr + t * 8 + k)  # Triton does not capture plain-int module globals
         if lid >= 0:
-            row = tl.load(rrow_ptr + t * 8 + k)
+            row = tl.load(rrow_ptr + t * 8 + k)  # Triton does not capture plain-int module globals
             y = tl.load(y_ptr + row.to(tl.int64) * H + offs).to(tl.float32) * (tl.load(gs_ptr + lid) * pw)
-            rr = tl.rsqrt(tl.sum(y * y, 0) / H + 1e-8)
-            acc += y * (rr * tl.load(w_ptr + t * 8 + k))
+            rr = tl.rsqrt(tl.sum(y * y, 0) / H + 1e-8)  # Triton does not capture plain-int module globals
+            acc += y * (rr * tl.load(w_ptr + t * 8 + k))  # Triton does not capture plain-int module globals
     tl.store(out_ptr + t.to(tl.int64) * H + offs, acc.to(tl.bfloat16))
 
 
-# ----------------------------------------------------------------------------------------------
-# prepare
-# ----------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# prepare: build the per-weights state once (extension, repacked weights,
+# tuned GEMM / attention choices). kernel_fn only reads this state.
+# --------------------------------------------------------------------------------------
+
 
 def _residual(gate):
+    """Residual-stream mixing coefficients from a residual gate: the branch
+    weight is beta = sigmoid(gate / 0.3), alpha = sqrt(sigmoid(-gate/0.3) * (1 + beta))."""
     w = gate.float() / 0.3
     beta = torch.sigmoid(w)
     alpha = torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1.0 + beta), min=1e-3))
     return alpha.contiguous(), beta.contiguous()
 
 
+def _split_router(router):
+    """Split the fp32 router weight into hi/lo BF16 halves stacked as one
+    [512, 8192] GEMM: one GEMM gives both partial-logit halves."""
+    hi = router.to(torch.bfloat16)
+    lo = (router - hi.float()).to(torch.bfloat16)
+    return torch.cat([hi, lo], 0).contiguous()
+
+
+def _fast_scales_ok(weights):
+    # The fast block-scale decode is exact only for positive normal E4M3
+    # scales (bytes 0x08..0x7E: no zero, subnormal, negative or NaN
+    # encodings); otherwise the extension is built with the exact decode.
+    return all(bool(((weights[k].view(torch.uint8) >= 0x08) & (weights[k].view(torch.uint8) <= 0x7E)).all())
+               for k in ("w13_sf", "w2_sf"))
+
+
 def prepare(weights):
+    global SIDE_STREAM
     dev = weights["qkv_gate"].device
     st = {}
     for n in ("qkv_gate", "o", "pooler", "unpooler"):
         st[n] = weights[n].contiguous()
-    router = weights["router"].float()
-    hi = router.to(torch.bfloat16)
-    lo = (router - hi.float()).to(torch.bfloat16)
-    st["router_hilo"] = torch.cat([hi, lo], 0).contiguous()  # [512, 8192]: one GEMM gives both halves
+    st["router_hilo"] = _split_router(weights["router"].float())
     st["router_bias"] = weights["router_bias"].float().contiguous()
     st["a1"], st["b1"] = _residual(weights["attn_residual_gate"])
     st["a2"], st["b2"] = _residual(weights["ffn_residual_gate"])
-    # norm weights stay BF16 exactly as given (applied as 1 + w): the kernels form 1 + w in fp32 when they load them
+    # Norm weights stay BF16 exactly as given (applied as 1 + w): the kernels form 1 + w in fp32 when they load them.
     for n in ("pre_ffn_norm", "pre_expert_norm", "post_expert_norm", "post_ffn_norm", "next_pre_attn_norm"):
         st["g_" + n] = weights[n].contiguous()
     st["inv_freq"] = (1.0 / (ROPE_THETA ** (torch.arange(0, HD, 2, device=dev).float() / HD))).contiguous()
-    # the fast block-scale decode is exact only for positive normal E4M3 scales (bytes 0x08..0x7E: no zero, subnormal,
-    # negative or NaN encodings); otherwise build the exact decode
-    fast_scales = all(bool(((weights[k].view(torch.uint8) >= 0x08) & (weights[k].view(torch.uint8) <= 0x7E)).all())
-                      for k in ("w13_sf", "w2_sf"))
-    st["mod"] = _build(fast_scales)
+    st["mod"] = _build(_fast_scales_ok(weights))
     st["w13r"] = _repack(weights["w13"], weights["w13_sf"], True)
     st["w2r"] = _repack(weights["w2"], weights["w2_sf"], False)
     st["w13_gs"] = weights["w13_gs"].float().contiguous()
@@ -253,41 +384,21 @@ def prepare(weights):
     st["no_zero_f"] = torch.empty((0,), dtype=torch.float32, device=dev)
     st["no_zero_b"] = torch.empty((0,), dtype=torch.bfloat16, device=dev)
     props = torch.cuda.get_device_properties(dev)
-    st["smem"] = 227 * 1024 if props.major >= 9 else 163 * 1024
+    st["smem"] = MOE_SMEM_SM90 if props.major >= 9 else MOE_SMEM_SM80
     if SKINNY_TEST:  # feasibility test build (MOE_SKINNY_TEST): 2 CTAs per SM
-        st["smem"] = 100 * 1024
+        st["smem"] = MOE_SMEM_SKINNY_TEST
     st["mod"].moe_init(st["smem"])
-    st["attn_smem"] = ATTN_SMEM + (0 if props.major >= 9 else 3 * 64 * 128)  # sm_80 test path stages P in smem
+    st["attn_smem"] = ATTN_SMEM + (0 if props.major >= 9 else ATTN_SMEM_SM80_EXTRA)
     st["mod"].attn_init(st["attn_smem"])
     st["no_pf"] = torch.empty((0,), dtype=torch.uint8, device=dev)
     st["nsm"] = props.multi_processor_count
-    _NSM[0] = st["nsm"]
     st["moe_dbg"] = torch.empty((0,), dtype=torch.int64, device=dev)  # a timeline buffer here turns on item tracing
     st["moe_flags"] = 0  # experiments only
-    if not _SIDE_STREAM:
-        _SIDE_STREAM.append(torch.cuda.Stream(device=dev))  # kept out of the state (only tensors/plain data there)
-    st["lt_choice"] = None
-    try:
-        st["lt"] = _build_lt()
-        st["lt_ws"] = torch.empty(64 << 20, dtype=torch.uint8, device=dev)
-        st["lt_ws_side"] = torch.empty(64 << 20, dtype=torch.uint8, device=dev)
-        st["lt_choice"] = _tune_lt(st)
-    except Exception as exc:  # noqa: BLE001
-        print("LT unavailable:", repr(exc)[:300], flush=True)
-        st["lt_choice"] = None
+    if SIDE_STREAM is None:
+        SIDE_STREAM = torch.cuda.Stream(device=dev)
+    st["lt_choice"] = _init_lt(st, dev)
     torch.cuda.synchronize()
-    st["attn_choice"] = None
-    if props.major >= 9 or OWN_ATTN_LOCAL:
-        try:
-            ok = _validate_attn(st, list(ATTN_VARIANTS) if props.major >= 9 else [24])
-            if ok:
-                if props.major >= 9 and ATTN_FIXED is not None and all(v in ok for v in ATTN_FIXED.values()):
-                    st["attn_choice"] = dict(ATTN_FIXED)  # a prepare-time race between near-equal options adds noise
-                else:
-                    st["attn_choice"] = _tune_attn(st, ok) if props.major >= 9 else {k: ok[0] for k in ("slide", "full_long", "full_short", "full_batch")}
-        except Exception as exc:  # noqa: BLE001
-            print("ATTN validation/tuning failed:", repr(exc)[:300], flush=True)
-            st["attn_choice"] = None
+    st["attn_choice"] = _choose_attention(st, props)
     if SELFTEST:
         try:
             _selftest(st, weights)
@@ -301,11 +412,862 @@ def prepare(weights):
     return st
 
 
-# ----------------------------------------------------------------------------------------------
-# expert GEMM (CUDA)
-# ----------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Dense GEMMs: torch.mm, or a cuBLASLt algorithm tuned in prepare when it
+# beats torch.mm (same library, different kernel choice). The tuner runs
+# once in prepare; kernel_fn only looks the choice up.
+# --------------------------------------------------------------------------------------
 
-KS, WBLK = 64, 4608
+
+def _lt_pin_index(lt, pid, pin):
+    """LT_PIN entry -> heuristic index: None (torch.mm), an int index (legacy), or a signature tuple
+    (tile id, split-K, reduction scheme, custom option) matched against each heuristic result's config
+    read back from cuBLASLt; returns -1 when no result matches (the caller then tunes as usual)."""
+    if pin is None:
+        return None
+    n = lt.lt_nalgo(pid)
+    if isinstance(pin, int):
+        return pin if pin < n else -1
+    for a in range(n):
+        info = list(lt.lt_info(pid, a))
+        if (info[0], info[1], info[6], info[8]) == tuple(pin):
+            return a
+    return -1
+
+
+def _lt_rel_err(out, ref):
+    """Max relative error of a candidate GEMM output against the torch.mm reference."""
+    return float((out.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-6))
+
+
+def _tune_lt(st):
+    """Time cuBLASLt's heuristic algorithms for each dense GEMM at the scored token counts; keep one
+    only where it beats torch.mm."""
+    lt = st["lt"]
+    dev = "cuda"
+    choice = {}
+    for T in LT_TOKENS:
+        for name, (wn, f32) in LT_GEMMS.items():
+            w = st[wn]
+            N, K = w.shape
+            x = (torch.randn((T, K), device=dev) * 0.5).to(torch.bfloat16)
+            odt = torch.float32 if f32 else torch.bfloat16
+            ref_fn = (lambda: torch.mm(x, w.t(), out_dtype=torch.float32)) if f32 else (lambda: torch.mm(x, w.t()))
+            ref = ref_fn().float()
+            t_ref = _time(ref_fn, reps=10)
+            if name == "router" and not ROUTER_LT:  # (the split-K pick steals the concurrent pooler's SMs)
+                del x
+                continue
+            out = torch.empty((T, N), dtype=odt, device=dev)
+            if name == "pooler" and POOL_SM_RESERVE.get(T, 0) > 0:
+                pid = lt.lt_plan_sm(T, N, K, f32, st["lt_ws"].numel(), 4, st["nsm"] - POOL_SM_RESERVE[T])
+                if lt.lt_nalgo(pid) > 0:
+                    lt.lt_run(pid, 0, x, w, out, st["lt_ws"])
+                    torch.cuda.synchronize()
+                    if _lt_rel_err(out, ref) < LT_ALGO_TOL:
+                        choice[(T, name)] = (pid, 0)
+                        t = _time(lambda: lt.lt_run(pid, 0, x, w, out, st["lt_ws"]), reps=10)
+                        print(f"LT T={T} pooler sized for {st['nsm'] - POOL_SM_RESERVE[T]} SMs: "
+                              f"{t:.1f}us alone (torch.mm {t_ref:.1f}us)", flush=True)
+                        del x, out
+                        continue
+            pid = lt.lt_plan(T, N, K, f32, st["lt_ws"].numel(), 32)
+            if (T, name) in LT_PIN:  # a fixed pick: no prepare-time race between near-equal algorithms
+                a = _lt_pin_index(lt, pid, LT_PIN[(T, name)])
+                if a != -1:  # -1: no heuristic result has the pinned signature -> time them as usual
+                    if a is not None:
+                        choice[(T, name)] = (pid, a)
+                    print(f"LT T={T} {name}: pinned {LT_PIN[(T, name)]} -> algo {a}", flush=True)
+                    del x, out
+                    continue
+                print(f"LT T={T} {name}: pinned signature {LT_PIN[(T, name)]} not offered; tuning instead", flush=True)
+            best = (t_ref, None)
+            for a in range(lt.lt_nalgo(pid)):
+                try:
+                    lt.lt_run(pid, a, x, w, out, st["lt_ws"])
+                    torch.cuda.synchronize()
+                    if not _lt_rel_err(out, ref) < LT_ALGO_TOL:
+                        continue
+                    t = _time(lambda: lt.lt_run(pid, a, x, w, out, st["lt_ws"]), reps=10)
+                except Exception:  # noqa: BLE001
+                    continue
+                if t < best[0] * LT_MIN_SPEEDUP:
+                    best = (t, a)
+            if best[1] is not None:
+                choice[(T, name)] = (pid, best[1])
+            print(f"LT tune T={T} {name}: torch.mm {t_ref:.1f}us, best {best[0]:.1f}us "
+                  f"algo {best[1]} of {lt.lt_nalgo(pid)}", flush=True)
+            del x, out
+    torch.cuda.empty_cache()
+    return choice
+
+
+def _init_lt(st, dev):
+    """Build the cuBLASLt extension and tune the dense GEMMs; None choice on any failure."""
+    try:
+        st["lt"] = _build_lt()
+        st["lt_ws"] = torch.empty(LT_WORKSPACE_BYTES, dtype=torch.uint8, device=dev)
+        st["lt_ws_side"] = torch.empty(LT_WORKSPACE_BYTES, dtype=torch.uint8, device=dev)
+        return _tune_lt(st)
+    except Exception as exc:  # noqa: BLE001
+        print("LT unavailable:", repr(exc)[:300], flush=True)
+        return None
+
+
+def _mm(st, x, name, side=False):
+    """x [T, K] @ W[N, K]^T with the tuned cuBLASLt algorithm for this shape, else torch.mm."""
+    T = x.shape[0]
+    choice = st["lt_choice"].get((T, name)) if st.get("lt_choice") else None
+    wn, f32 = LT_GEMMS[name]
+    w = st[wn]
+    if choice is None:
+        return torch.mm(x, w.t(), out_dtype=torch.float32) if f32 else torch.mm(x, w.t())
+    out = torch.empty((T, w.shape[0]), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+    st["lt"].lt_run(choice[0], choice[1], x, w, out, st["lt_ws_side"] if side else st["lt_ws"])
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Weight repack: NVFP4 expert weights into the fused kernel's layout.
+# --------------------------------------------------------------------------------------
+
+
+def _codes(packed):
+    """uint8 [..., K/2] -> uint8 codes [..., K] (element 2i = low nibble)."""
+    lo = packed & 15
+    hi = packed >> 4
+    return torch.stack((lo, hi), dim=-1).flatten(-2)
+
+
+# Nibble slot i (the old layout's 4i..4i+3) -> bit positions of (m0, m1, m2, sign) in the 32-bit word
+# (see convert8 in _CUDA_SRC).
+_CODE_POS = {3: (6, 7, 8, 15), 7: (22, 23, 24, 31), 2: (2, 3, 4, 11), 6: (18, 19, 20, 27),
+             1: (28, 29, 30, 5), 5: (12, 13, 14, 21), 0: (0, 1, 26, 9), 4: (16, 17, 10, 25)}  # MOE_DQ7 layout
+
+
+def _repack(w, sf, gated):
+    """w: uint8 [E, N, 2048]; sf: e4m3 [E, N, 256] -> uint8 [E, N/128, KS, WBLK]."""
+    E, N, _ = w.shape
+    n_tiles = N // 128
+    dev = w.device
+    if gated:
+        nt = torch.arange(n_tiles, device=dev).view(n_tiles, 1, 1)
+        q = torch.arange(8, device=dev).view(1, 8, 1)
+        lr = torch.arange(16, device=dev).view(1, 1, 16)
+        perm = torch.where(lr < 8, 64 * nt + 8 * q + lr, 4096 + 64 * nt + 8 * q + lr - 8).reshape(-1)
+    else:
+        perm = torch.arange(N, device=dev)
+    out = torch.empty((E, n_tiles, KS, WBLK), dtype=torch.uint8, device=dev)
+    sf_u8 = sf.view(torch.uint8)
+    shifts = torch.tensor([3, 7, 1, 5, 2, 6, 0, 4], dtype=torch.int32, device=dev)  # (half, hk, b) order below
+    pos = torch.tensor([_CODE_POS[int(i)] for i in shifts.tolist()], dtype=torch.int64, device=dev)  # [8, 4]
+    for e in range(E):
+        c = _codes(w[e][perm]).to(torch.int32)  # [N, 4096]
+        # rows: [nt, wg, w, half, g]; k: [ks, j, hk, t, b]
+        c = c.view(n_tiles, 2, 4, 2, 8, KS, 4, 2, 4, 2)
+        # -> [nt, ks, wg, w, g, t, j, half, hk, b]
+        c = c.permute(0, 5, 1, 2, 4, 8, 6, 3, 7, 9).reshape(n_tiles, KS, 2, 4, 8, 4, 4, 8)
+        # Nibble index for (half, hk, b): i = 3 - (half + 2*hk) + 4*b; flattened order (half, hk, b):
+        # (0,0,0)->3 (0,0,1)->7 (0,1,0)->1 (0,1,1)->5 (1,0,0)->2 (1,0,1)->6 (1,1,0)->0 (1,1,1)->4
+        # Bit layout read by convert8 (rotate + mask per register): code bit b of the code in nibble slot i goes to
+        # bit _CODE_POS[i][b] (b: m0, m1, m2, sign).
+        cb = (c.to(torch.int64).unsqueeze(-1) >> torch.arange(4, device=dev)) & 1  # [..., 8, 4]
+        words = (cb << pos).sum((-1, -2)) & 0xFFFFFFFF
+        wbytes = torch.stack([(words >> (8 * i)) & 0xFF for i in range(4)], dim=-1).to(torch.uint8)
+        out[e, :, :, :4096] = wbytes.reshape(n_tiles, KS, 4096)
+        s = sf_u8[e][perm].view(n_tiles, 2, 4, 2, 8, KS, 4)  # rows [nt, wg, w, half, g]; cols [ks, j]
+        s = s.permute(0, 5, 1, 2, 4, 6, 3).reshape(n_tiles, KS, 512)  # [nt, ks, wg, w, g, j, half]
+        out[e, :, :, 4096:] = s
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Attention: FA3 paged FP8 path, the FP32 fallback for non-Hopper devices,
+# and the file's own Hopper kernel (validated + tuned in prepare).
+# --------------------------------------------------------------------------------------
+
+
+def _attention_fallback(data, q8, cfg):
+    """Local (non-Hopper) attention over the paged FP8 cache, FP32 math. Testing only: it
+    synchronises (`.tolist()`), so it is not on the scored path."""
+    B, L = cfg["batch"], cfg["q_len"]
+    page, window = cfg["page_size"], cfg["window"]
+    ks, vs = data["k_scale"].float(), data["v_scale"].float()
+    kf = data["k_cache"].view(-1, HKV, HD)
+    vf = data["v_cache"].view(-1, HKV, HD)
+    scale = cfg["sm_scale"] * cfg["qk_scale_factor"]
+    out = torch.empty((B * L, HQ, HD), dtype=torch.bfloat16, device=q8.device)
+    seq_lens = data["seq_lens"].tolist()
+    for b in range(B):
+        seq = seq_lens[b]
+        first = max(0, seq - window + 1) if window else 0
+        kp = torch.arange(first, seq + L, device=q8.device)
+        rows = data["page_table"][b].long()[kp // page] * page + kp % page
+        keys = kf[rows].float() * ks
+        vals = vf[rows].float() * vs
+        q = q8[b * L:(b + 1) * L].float()
+        for c in range(0, L, FALLBACK_Q_BLOCK):
+            qp = seq + torch.arange(c, min(c + FALLBACK_Q_BLOCK, L), device=q8.device)
+            vis = kp[None, :] <= qp[:, None]
+            if window:
+                vis &= kp[None, :] > qp[:, None] - window
+            qq = q[c:c + FALLBACK_Q_BLOCK].view(-1, HKV, HQ // HKV, HD)
+            att = torch.einsum("lkgd,skd->lkgs", qq, keys) * scale
+            att = att.masked_fill(~vis[:, None, None, :], float("-inf")).softmax(-1)
+            out[b * L + c: b * L + c + qq.shape[0]] = torch.einsum("lkgs,skd->lkgd", att, vals).reshape(-1, HQ, HD).to(torch.bfloat16)
+    return out
+
+
+def _attention(data, q8, cfg):
+    """FA3 paged FP8 attention (or the FP32 fallback when FA3 is unavailable)."""
+    if _fa3 is None:
+        return _attention_fallback(data, q8, cfg)
+    window = cfg["window"]
+    scaled = cfg["kv_scale"] != 1.0
+    descale = {}
+    if scaled:
+        B = cfg["batch"]
+        descale = dict(k_descale=data["k_scale"].reshape(1, 1).expand(B, HKV),
+                       v_descale=data["v_scale"].reshape(1, 1).expand(B, HKV))
+    out = _fa3(q=q8.view(-1, HQ, HD), k_cache=data["k_cache"], v_cache=data["v_cache"],
+               page_table=data["page_table"], cache_seqlens=data["cache_seqlens"],
+               cu_seqlens_q=data["cu_seqlens_q"], max_seqlen_q=cfg["q_len"],
+               softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"], causal=True,
+               window_size=(window - 1, 0) if window else (-1, -1),
+               scheduler_metadata=data["scheduler_metadata"], **descale)
+    if isinstance(out, tuple):
+        out = out[0]
+    return out
+
+
+def _attention_norm_gate(data, q8, qkv, cfg):
+    """FA3 attention followed by the fused `rms(att) * sigmoid(gate)` epilogue -> og [T, Q_SIZE]."""
+    T = cfg["tokens"]
+    att = _attention(data, q8, cfg)
+    og = torch.empty((T, Q_SIZE), dtype=torch.bfloat16, device=q8.device)
+    _norm_gate_kernel[(T,)](att, qkv, og, num_warps=4)
+    return og
+
+
+def _attn_splits(cfg, data, variant, nsm):
+    """Key-range splits so that small batches still fill the GPU (each split keeps >= 8 key tiles)."""
+    B, L, window = cfg["batch"], cfg["q_len"], cfg["window"]
+    qb = ATTN_Q_ROWS_PER_WARPGROUP * ATTN_VARIANTS[variant][0]
+    base = ((L + qb - 1) // qb) * 2 * B
+    if base >= 2 * nsm:
+        return 1
+    keys = (window + qb) if window else data["page_table"].shape[1] * cfg["page_size"]
+    nmax = max(1, min(ATTN_MAX_SPLITS, (keys // ATTN_KEY_TILE) // 8))
+    if ATTN_SPLIT_MODE == 1:
+        best = None
+        for ns in range(1, nmax + 1):
+            cost = -(-base * ns // nsm) / ns + (ATTN_SPLIT_PENALTY if ns > 1 else 0.0)
+            if best is None or cost < best[0] - 1e-9:
+                best = (cost, ns)
+        return best[1]
+    ns = min((2 * nsm + base - 1) // base, nmax)
+    return max(1, min(ns, ATTN_MAX_SPLITS))
+
+
+def _attn_class(cfg):
+    """Shape class of an attention call: the key prepare must choose by."""
+    if cfg["window"]:
+        return "slide"
+    if cfg["tokens"] > 4096:
+        return "full_long"
+    return "full_batch" if cfg["batch"] > 1 else "full_short"
+
+
+def _attn_variant(st, cfg):
+    """Own-kernel variant for this call's shape class, or None for the FA3 path."""
+    choice = st.get("attn_choice")
+    if not choice:
+        return None
+    return choice[_attn_class(cfg)]
+
+
+def _attn_stage_buffers(data, cfg, dev):
+    """Staging buffers for the own attention kernel: K tiles and V tiles per (batch, head)."""
+    B, L, window, page = cfg["batch"], cfg["q_len"], cfg["window"], cfg["page_size"]
+    smax = (window - 1 + L) if window else data["page_table"].shape[1] * page
+    ntk = (smax + ATTN_KEY_TILE - 1) // ATTN_KEY_TILE
+    kt = torch.empty((B, 2, ntk, ATTN_KEY_TILE * HD), dtype=torch.uint8, device=dev)
+    vt = torch.empty((B, 2, ntk, 72 * ATTN_KEY_TILE), dtype=torch.uint8, device=dev)
+    return ntk, kt, vt
+
+
+def _attn_prep_split(st, data, cfg, ev=None):
+    """Stage the tiles made only of keys already in the cache on the side stream (it needs nothing
+    from this call's qk_prep, so it overlaps the qkv GEMM's idle SMs); _attn_custom stages the rest
+    after joining it. With `ev` (an event recorded before the qkv GEMM was enqueued) the side branch
+    is captured after the GEMM node."""
+    main, side = torch.cuda.current_stream(), SIDE_STREAM
+    pre = _attn_stage_buffers(data, cfg, data["attn_input"].device)
+    if ev is not None:
+        side.wait_event(ev)
+    else:
+        side.wait_stream(main)
+    with torch.cuda.stream(side):
+        st["mod"].attn_prep(data["k_cache"].view(torch.uint8), data["v_cache"].view(torch.uint8), data["page_table"],
+                            data["seq_lens"], cfg["page_size"], cfg["q_len"], cfg["window"], pre[0], pre[1], pre[2], 1)
+    return pre
+
+
+def _attn_custom(st, data, q8, qkv, cfg, nsplit=1, variant=0, pre=None):
+    """FP8 attention (own kernel) with the output norm * sigmoid(gate) fused: returns og [T, Q_SIZE] bf16."""
+    B, L, window, page = cfg["batch"], cfg["q_len"], cfg["window"], cfg["page_size"]
+    dev = q8.device
+    if pre is not None:  # part 1 was issued on the side stream by _attn_prep_split: join it, then stage the rest
+        ntk, kt, vt = pre
+        torch.cuda.current_stream().wait_stream(SIDE_STREAM)
+    else:
+        ntk, kt, vt = _attn_stage_buffers(data, cfg, dev)
+    st["mod"].attn_prep(data["k_cache"].view(torch.uint8), data["v_cache"].view(torch.uint8), data["page_table"],
+                        data["seq_lens"], page, L, window, ntk, kt, vt, 2 if pre is not None else 0)
+    out = torch.empty((B * L, Q_SIZE), dtype=torch.bfloat16, device=dev)
+    c = cfg["sm_scale"] * cfg["qk_scale_factor"] * cfg["kv_scale"] * LOG2E
+    if nsplit < 0:  # stream-K over -nsplit CTAs: int header (W, pair prefix, first pairs) + npairs + G partial slots
+        G, nqb = -nsplit, (L + ATTN_SK_Q_BLOCK - 1) // ATTN_SK_Q_BLOCK
+        hdr = (2 + B * nqb * 2 + 1 + G + 63) // 64 * 64  # must match GLUE's ((2 + npairs + 1 + G) + 63) & ~63
+        # Layout agreed with attn_fwd_sk_kernel: header + per-pair blocks of
+        # ATTN_SK_Q_BLOCK q-rows x 8 x ATTN_SPLIT_SLOT.
+        ws = torch.empty((hdr + (B * nqb * 2 + G) * ATTN_SK_Q_BLOCK * 8 * ATTN_SPLIT_SLOT,), dtype=torch.float32, device=dev)
+    else:
+        ws = torch.empty((nsplit, B * L, HQ, ATTN_SPLIT_SLOT), dtype=torch.float32, device=dev) if nsplit > 1 else out
+    pf = st["o"] if B * L <= ATTN_PF_MAX_T else st["no_pf"]  # o-proj weight into L2 during the attention
+    st["mod"].attn_fwd(q8.view(torch.uint8), kt, vt, data["seq_lens"], qkv, out, L, window, ntk, c, cfg["kv_scale"],
+                       st["attn_smem"], nsplit, ws, variant, pf)
+    return out
+
+
+def _synthetic_attn_case(B, L, ctx, window, page, seed):
+    """A synthetic attention case (random data, paged cache) for validation / tuning."""
+    dev = "cuda"
+    g = torch.Generator(device=dev)
+    g.manual_seed(seed)
+    S = ctx + L
+    npg = (S + page - 1) // page
+    T = B * L
+    q8 = (torch.randn((T, HQ, HD), device=dev, generator=g) * 0.7).to(FP8)
+    qkv = torch.randn((T, QKV_SIZE), device=dev, generator=g).to(torch.bfloat16)
+    kc = (torch.randn((B * npg, page, HKV, HD), device=dev, generator=g) * 0.8 + 0.3).to(FP8)  # [pages, page_size, 2, 64]
+    vc = torch.randn((B * npg, page, HKV, HD), device=dev, generator=g).to(FP8)
+    pt = torch.randperm(B * npg, device=dev, generator=g).to(torch.int32).view(B, npg)
+    data = {"k_cache": kc, "v_cache": vc, "page_table": pt, "seq_lens": torch.full((B,), ctx, dtype=torch.int32, device=dev),
+            "cache_seqlens": torch.full((B,), S, dtype=torch.int32, device=dev),
+            "cu_seqlens_q": torch.arange(0, T + 1, L, dtype=torch.int32, device=dev), "scheduler_metadata": None,
+            "k_scale": torch.tensor(1.0, device=dev), "v_scale": torch.tensor(1.0, device=dev)}
+    cfg = {"batch": B, "q_len": L, "window": window, "page_size": page, "sm_scale": SYNTH_SM_SCALE,
+           "qk_scale_factor": SYNTH_QK_SCALE_FACTOR, "kv_scale": 1.0, "tokens": T}
+    return data, cfg, q8, qkv
+
+
+def _attn_ref(data, cfg, q8, qkv):
+    """Reference attention path (FA3 + norm-gate) for validating the own kernel."""
+    return _attention_norm_gate(data, q8, qkv, cfg)
+
+
+def _validate_attn(st, variants):
+    """Check own-kernel variants against the reference attention path on small synthetic cases; returns
+    the variants that agree."""
+    worst = {v: 0.0 for v in variants}
+    for i, (B, L, ctx, window, page) in enumerate(((2, 300, 1000, 0, 1), (1, 400, 3000, 256, 1), (2, 100, 200, 0, 64))):
+        data, cfg, q8, qkv = _synthetic_attn_case(B, L, ctx, window, page, 7 + i)
+        ref = _attn_ref(data, cfg, q8, qkv).float()
+        for v in variants:
+            for ns in (1, 3):
+                o = _attn_custom(st, data, q8, qkv, cfg, nsplit=ns, variant=v).float()
+                err = float((o - ref).norm() / ref.norm())
+                worst[v] = max(worst[v], err if err == err else 1e9)
+    ok = [v for v in variants if worst[v] < ATTN_VALIDATE_TOL]
+    print("ATTN own kernel validation (worst rel err):", {v: round(e, 4) for v, e in worst.items()}, "->", ok, flush=True)
+    return ok
+
+
+def _tune_attn(st, variants):
+    """Pick, per attention shape class, the fastest of the reference path and the validated own variants."""
+    choice = {}
+    # The scored shapes themselves (synthetic data): sliding 16K chunk, full 16K chunk at 32K context, turn 1 / turn 4 full.
+    for kind, (B, L, ctx, window) in (("slide", (1, 16384, 32768, 2048)), ("full_long", (1, 16384, 32768, 0)),
+                                      ("full_short", (1, 753, 80000, 0)), ("full_batch", (4, 753, 80000, 0))):
+        data, cfg, q8, qkv = _synthetic_attn_case(B, L, ctx, window, 1, 11)
+        res = {"ref": _time(lambda: _attn_ref(data, cfg, q8, qkv), reps=5)}
+        for v in variants:
+            ns = _attn_splits(cfg, data, v, st["nsm"])
+            res[v] = _time(lambda: _attn_custom(st, data, q8, qkv, cfg, nsplit=ns, variant=v), reps=5)
+        best = min(res, key=res.get)
+        choice[kind] = None if best == "ref" else best
+        print(f"ATTN tune {kind}: " + " ".join(f"{k}={t:.0f}us" for k, t in res.items()) + f" -> {best}", flush=True)
+        del data, q8, qkv
+    torch.cuda.empty_cache()
+    return choice
+
+
+def _choose_attention(st, props):
+    """Validate (and, on Hopper, tune) the own attention kernel; returns the per-class variant choice."""
+    if not (props.major >= 9 or OWN_ATTN_LOCAL):
+        return None
+    try:
+        ok = _validate_attn(st, list(ATTN_VARIANTS) if props.major >= 9 else [24])
+        if not ok:
+            return None
+        if props.major >= 9 and ATTN_FIXED is not None and all(v in ok for v in ATTN_FIXED.values()):
+            # A prepare-time race between near-equal options adds noise: pin the measured picks.
+            return dict(ATTN_FIXED)
+        if props.major >= 9:
+            return _tune_attn(st, ok)
+        return {k: ok[0] for k in ("slide", "full_long", "full_short", "full_batch")}
+    except Exception as exc:  # noqa: BLE001
+        print("ATTN validation/tuning failed:", repr(exc)[:300], flush=True)
+        return None
+
+
+# --------------------------------------------------------------------------------------
+# MoE: gather the pooler output into per-expert rows, run the fused expert
+# GEMMs, return the per-route rows for the combine step.
+# --------------------------------------------------------------------------------------
+
+
+def _max_tiles(T):
+    """Upper bound on the plan's tile count for T tokens (min-size tiles + slack)."""
+    return T * TOP_K // MIN_TILE_ROWS + MOE_TILE_SLACK
+
+
+def _moe_forward(st, p, lid, pos, cnt, T, order=None, zb=None, cit=None):
+    """Routed experts on the pooler output p [T, 4096]: returns per-route rows y [rows, 4096] (bf16) and rrow.
+    With cit (dict: zc = [max tiles | 4] zeroed counters, tok = [2T + rows] ints, topw, out) the fused kernel
+    also writes the combined output (combine in the tail) and the caller skips the combine kernel."""
+    dev = p.device
+    mod = st["mod"]
+    maxrows = T * TOP_K + LOCAL_EXPERTS * MAX_PADDED_ROWS_PER_EXPERT
+    maxtiles = _max_tiles(T)
+    offsets = torch.empty((LOCAL_EXPERTS,), dtype=torch.int32, device=dev)
+    rows = torch.empty((LOCAL_EXPERTS,), dtype=torch.int32, device=dev)
+    tiles = torch.empty((maxtiles, 4), dtype=torch.int32, device=dev)
+    ntiles = torch.empty((1,), dtype=torch.int32, device=dev)
+    large = T >= MOE_LARGE_T
+    mode = MOE_MODE_LARGE if large else MOE_MODE_SMALL
+    if order is None:
+        order = MOE_ORDER_LARGE if large else MOE_ORDER_SMALL
+    fine = 1 if (FINE_MIN_T and T >= FINE_MIN_T) else 0  # remainder tiles rounded to 32 rows (plan + kernel agree)
+    order = order | (fine << MOE_FINE_ORDER_SHIFT)
+    xt = torch.empty((maxrows, D_EXPERT), dtype=torch.bfloat16, device=dev)
+    rrow = torch.empty((T, TOP_K), dtype=torch.int32, device=dev)
+    if cit is not None and (not GATHER_PLAN or mode != "fused"):
+        raise RuntimeError("CIT needs the fused kernel and the gather+plan launch")
+    cz = cit["zc"] if cit is not None else st["no_zero"]
+    ctok = cit["tok"] if cit is not None else st["no_zero"]
+    if GATHER_PLAN:  # the gather kernel also writes the plan (one launch fewer)
+        mod.moe_gather_plan(p, st["g_pre_expert_norm"], lid, pos, cnt, xt, rrow, offsets, tiles, ntiles, rows, order, cz, ctok)
+    else:
+        mod.moe_plan(cnt, offsets, tiles, ntiles, rows, order)
+        mod.moe_gather(p, st["g_pre_expert_norm"], lid, pos, offsets, cnt, xt, rrow)
+    inter = torch.empty((maxrows, D_EXPERT), dtype=torch.bfloat16, device=dev)
+    y = torch.empty((maxrows, D_EXPERT), dtype=torch.bfloat16, device=dev)
+    if mode == "fused":
+        if zb is None:
+            zb = torch.zeros((1 + maxtiles,), dtype=torch.int32, device=dev)  # work counter + per-tile GEMM1 completion
+        mod.moe_fused(st["w13r"], st["w2r"], xt, inter, y, tiles, ntiles, st["w13_gs"], st["w2_gs"],
+                      st["nsm"] * (2 if SKINNY_TEST else 1), st["smem"],
+                      zb[0:1], zb[1:1 + maxtiles], st["moe_dbg"], st["moe_flags"] | (fine << MOE_FINE_ORDER_SHIFT), cz, ctok,
+                      rrow, lid, cit["topw"] if cit is not None else st["no_zero_f"], st["g_post_expert_norm"],
+                      cit["out"] if cit is not None else st["no_zero_b"])
+    elif mode == "persist":
+        ctr = torch.zeros((2,), dtype=torch.int32, device=dev)
+        mod.moe_gemm_p(st["w13r"], xt, tiles, ntiles, st["w13_gs"], inter, 64, st["nsm"], True, st["smem"], ctr[0:1])
+        mod.moe_gemm_p(st["w2r"], inter, tiles, ntiles, st["w2_gs"], y, 32, st["nsm"], False, st["smem"], ctr[1:2])
+    else:
+        mod.moe_gemm(st["w13r"], xt, tiles, ntiles, st["w13_gs"], inter, 64, P_GEMM1, True, st["smem"])
+        mod.moe_gemm(st["w2r"], inter, tiles, ntiles, st["w2_gs"], y, 32, P_GEMM2, False, st["smem"])
+    return dict(y=y, rrow=rrow, xt=xt, inter=inter, tiles=tiles, ntiles=ntiles, offsets=offsets)
+
+
+# --------------------------------------------------------------------------------------
+# kernel_fn: one prefill layer step.
+# --------------------------------------------------------------------------------------
+
+
+def _run_qk_prep(st, data, qkv, q8, cfg):
+    """Q/K RMS-norm + RoPE + FP8 quantisation + cache stores (CUDA kernel, or the Triton twin)."""
+    if QK_PREP_CUDA:
+        st["mod"].qk_prep(qkv, data["positions"], data["cache_loc"], st["inv_freq"], q8, data["k_cache"].view(torch.uint8),
+                          data["v_cache"].view(torch.uint8), data["k_scale"], data["v_scale"], bool(cfg["rope_theta"]),
+                          cfg["kv_scale"] != 1.0)
+    else:
+        T = cfg["tokens"]
+        _qk_prep_kernel[(T,)](qkv, data["positions"], data["cache_loc"], st["inv_freq"], q8,
+                              data["k_cache"].view(torch.uint8), data["v_cache"].view(torch.uint8), data["k_scale"],
+                              data["v_scale"], ROPE=bool(cfg["rope_theta"]), SCALED=cfg["kv_scale"] != 1.0, num_warps=4,
+                              **(dict(PDL=True, launch_pdl=True) if TRITON_PDL else {}))
+
+
+def _run_attention(st, data, q8, qkv, cfg, variant, pre):
+    """Attention + norm-gate epilogue -> og [T, Q_SIZE]."""
+    if variant is not None:
+        ns = _attn_splits(cfg, data, variant, st["nsm"])
+        sk = ATTN_SK.get(_attn_class(cfg), 0)
+        if sk and variant in (8, 43) and cfg["batch"] * ((cfg["q_len"] + ATTN_SK_Q_BLOCK - 1) // ATTN_SK_Q_BLOCK) * 2 <= ATTN_SK_MAX_PAIRS:
+            ns = -sk
+        return _attn_custom(st, data, q8, qkv, cfg, nsplit=ns, variant=variant, pre=pre)
+    # kernel_fn's FA3 path views q8 as FP8 (the reference path in _attn_ref passes the raw uint8 tensor).
+    return _attention_norm_gate(data, q8.view(FP8), qkv, cfg)
+
+
+def kernel_fn(data, state):
+    st = state
+    cfg = data["config"]
+    T = cfg["tokens"]
+    dev = data["attn_input"].device
+    # --- attention ---
+    av = _attn_variant(st, cfg)
+    pre = None
+    split = av is not None and T <= PREP_SPLIT_MAX_T and PREP_SPLIT.get("slide" if cfg["window"] else "full", False)
+    if split and not PREP_SPLIT_AFTER:
+        pre = _attn_prep_split(st, data, cfg)
+    ev0 = None
+    if split and PREP_SPLIT_AFTER:
+        ev0 = torch.cuda.Event()
+        ev0.record()
+    qkv = _mm(st, data["attn_input"], "qkv")
+    if ev0 is not None:
+        pre = _attn_prep_split(st, data, cfg, ev0)
+    q8 = torch.empty((T, Q_SIZE), dtype=torch.uint8, device=dev)
+    _run_qk_prep(st, data, qkv, q8, cfg)
+    og = _run_attention(st, data, q8, qkv, cfg, av, pre)
+    a = _mm(st, og, "o")
+    h = torch.empty((T, HIDDEN), dtype=torch.bfloat16, device=dev)
+    maxtiles = _max_tiles(T)
+    use_cit = CIT and MOE_MODE_SMALL == "fused" and MOE_MODE_LARGE == "fused" and GATHER_PLAN
+    # zb layout: [per-expert counts: LOCAL_EXPERTS | work counter: 1 | tile done: maxtiles
+    #             | (CIT: GEMM2 done: maxtiles | head, tail, error, pad: 4)]
+    zlen = LOCAL_EXPERTS + 1 + maxtiles + ((maxtiles + 4) if use_cit else 0)
+    recompute = T >= BND_CUDA_MIN and BND_RECOMPUTE and T >= BND_RC_MIN_T
+    if recompute:  # the first boundary keeps only the branch's rms factor; the second rebuilds the fp32 stream from it
+        zb = torch.empty((zlen,), dtype=torch.int32, device=dev)
+        r1 = torch.empty((T,), dtype=torch.float32, device=dev)
+        st["mod"].boundary_rc(a, data["stream"], st["a1"], st["a1"], st["b1"], st["g_pre_ffn_norm"], data["stream"], h, 1, zb,
+                              a, r1, st["a1"], st["b1"])
+    elif T >= BND_CUDA_MIN:  # the boundary kernel also zeroes zb (counts | work counter | tile done)
+        stream1 = torch.empty((T, HIDDEN), dtype=torch.float32, device=dev)
+        zb = torch.empty((zlen,), dtype=torch.int32, device=dev)
+        st["mod"].boundary(a, data["stream"], st["a1"], st["a1"], st["b1"], st["g_pre_ffn_norm"], stream1, h, False, zb)
+    else:
+        stream1 = torch.empty((T, HIDDEN), dtype=torch.float32, device=dev)
+        zb = torch.zeros((zlen,), dtype=torch.int32, device=dev)
+        _boundary_kernel[(T,)](a, data["stream"], a, st["a1"], st["b1"], st["g_pre_ffn_norm"], stream1, h,
+                               HAS_GPOST=False, H=HIDDEN, num_warps=16)
+    # --- router + top-8 on a side stream, concurrent with the pooler GEMM ---
+    main = torch.cuda.current_stream()
+    side = SIDE_STREAM
+    serial = T <= ROUTER_SERIAL_MAX or T >= ROUTER_SERIAL_MIN
+    if serial:  # the router GEMM alone on all SMs first: cheaper than slowing the pooler down by sharing SMs with it
+        logits = _mm(st, h, "router")
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        if not serial:
+            logits = _mm(st, h, "router", side=True)  # [T, 512] fp32: hi | lo partial logits
+        ids = torch.empty((T, TOP_K), dtype=torch.int32, device=dev)
+        topw = torch.empty((T, TOP_K), dtype=torch.float32, device=dev)
+        lid = torch.empty((T, TOP_K), dtype=torch.int32, device=dev)
+        pos = torch.empty((T, TOP_K), dtype=torch.int32, device=dev)
+        cnt = zb[:LOCAL_EXPERTS]
+        cit = None
+        if use_cit:  # tok_left (T) | combine queue (T) | row -> token map (rows)
+            ctok = torch.empty((2 * T + T * TOP_K + LOCAL_EXPERTS * MAX_PADDED_ROWS_PER_EXPERT,), dtype=torch.int32, device=dev)
+            cit = dict(zc=zb[LOCAL_EXPERTS + 1 + maxtiles:], tok=ctok, topw=topw)
+        st["mod"].moe_route(logits, st["router_bias"], data["local_start"], ids, topw, lid, pos, cnt,
+                            ctok[:T] if use_cit else st["no_zero"], ctok[T:2 * T] if use_cit else st["no_zero"])  # one warp per token
+    # --- experts ---
+    p = _mm(st, h, "pooler")
+    main.wait_stream(side)
+    moe = torch.empty((T, D_EXPERT), dtype=torch.bfloat16, device=dev)
+    if cit is not None:
+        cit["out"] = moe
+    ex = _moe_forward(st, p, lid, pos, cnt, T, zb=zb[LOCAL_EXPERTS:], cit=cit)
+    y, rrow = ex["y"], ex["rrow"]
+    if cit is not None:
+        pass  # combined in the fused kernel's tail
+    elif CUDA_COMBINE:  # one block per token, PDL (the per-expert scale is 1: st["ones32"])
+        st["mod"].moe_combine(y, rrow, lid, topw, st["g_post_expert_norm"], moe)
+    elif TRITON_PDL:
+        _combine_kernel[(T,)](y, rrow, lid, topw, st["ones32"], st["g_post_expert_norm"], moe, H=D_EXPERT, PDL=True, num_warps=8,
+                          launch_pdl=True)
+    else:
+        _combine_kernel[(T,)](y, rrow, lid, topw, st["ones32"], st["g_post_expert_norm"], moe, H=D_EXPERT,
+                              num_warps=COMBINE_NW_SMALL if T <= COMBINE_SMALL_T else 8)
+    f = _mm(st, moe, "unpooler")
+    stream2 = torch.empty((T, HIDDEN), dtype=torch.float32, device=dev)
+    hidden = torch.empty((T, HIDDEN), dtype=torch.bfloat16, device=dev)
+    if recompute:
+        st["mod"].boundary_rc(f, data["stream"], st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], stream2,
+                              hidden, 2, st["no_zero"], a, r1, st["a1"], st["b1"])
+    elif T >= BND_CUDA_MIN:
+        st["mod"].boundary(f, stream1, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], stream2, hidden,
+                           True, st["no_zero"])
+    else:
+        _boundary_kernel[(T,)](f, stream1, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"],
+                               stream2, hidden, HAS_GPOST=True, H=HIDDEN, num_warps=16)
+    return hidden, stream2, ids
+
+
+# --------------------------------------------------------------------------------------
+# Self-tests / micro-benchmarks, printed from prepare() when SELFTEST is on.
+# They never run on the scored path; they exist to check the kernels against
+# a reference and to time the pieces. All timing goes through _time, which
+# flushes L2 before each call the way the judge's replays do.
+# --------------------------------------------------------------------------------------
+
+
+def _routes_from_counts(T, counts, dev):
+    """Build (lid, pos, cnt) for a synthetic routing: counts[e] tokens to expert e."""
+    lid = torch.full((T, TOP_K), -1, dtype=torch.int32, device=dev)
+    pos = torch.zeros((T, TOP_K), dtype=torch.int32, device=dev)
+    r = 0
+    for e, c in enumerate(counts):
+        idx = torch.arange(r, r + c, device=dev)
+        lid.view(-1)[(idx % T) * TOP_K + idx // T] = e
+        pos.view(-1)[(idx % T) * TOP_K + idx // T] = torch.arange(c, device=dev, dtype=torch.int32)
+        r += c
+    cnt = torch.zeros(LOCAL_EXPERTS, dtype=torch.int32, device=dev)
+    cnt[: len(counts)] = torch.tensor(counts, dtype=torch.int32, device=dev)
+    return lid, pos, cnt
+
+
+_FLUSH_BUF = None
+
+
+def _time(fn, reps=5):
+    """Median time in us with a cold L2 (a read sweep over 256 MB before each call, like the judge's replays)."""
+    global _FLUSH_BUF
+    if _FLUSH_BUF is None:
+        _FLUSH_BUF = (torch.ones(128 << 20, dtype=torch.float16, device="cuda"),
+                      torch.zeros((), dtype=torch.float32, device="cuda"))
+    buf, sink = _FLUSH_BUF
+    fn()
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(reps):
+        sink.copy_(buf.sum(dtype=torch.float32))
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        fn()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) * 1000)
+    ts.sort()
+    return ts[len(ts) // 2]
+
+
+SCEN = {
+    "T16384": (16384, [12547, 11910, 2820, 2392, 270, 242, 97, 60, 34, 16, 14, 2, 1, 1, 1]),
+    "T3012": (3012, [2277, 2191, 416, 400, 47, 37, 32, 11, 7, 5, 4, 3, 2, 1, 1]),
+    "T753": (753, [540, 529, 127, 108, 14, 6, 3, 3, 3, 2, 1, 1]),
+}
+
+
+def _selftest(st, weights):
+    from nvfp4 import dequantize
+    dev = weights["w13"].device
+    mod = st["mod"]
+    torch.manual_seed(0)
+    # correctness on a small skewed routing
+    T = 700
+    counts = [300, 200, 100, 60, 33, 17, 14, 5, 1]  # 14 -> N=16, 5 and 1 -> N=8 tiles (below FINE_MIN_T)
+    lid, pos, cnt = _routes_from_counts(T, counts, dev)
+    p = torch.randn((T, D_EXPERT), device=dev).to(torch.bfloat16)
+    gw = st["g_pre_expert_norm"]
+    out = _moe_forward(st, p, lid, pos, cnt, T)
+    y, rrow = out["y"], out["rrow"]
+    pf = p.float()
+    xn = (pf * torch.rsqrt(pf.pow(2).mean(-1, keepdim=True) + RMS_EPS) * (1.0 + gw.float())).to(torch.bfloat16)
+    msg = []
+    for e in range(len(counts)):
+        tok, slot = (lid == e).nonzero(as_tuple=True)
+        W13 = dequantize(weights["w13"][e], weights["w13_sf"][e], weights["w13_gs"][e]).to(torch.bfloat16)
+        W2 = dequantize(weights["w2"][e], weights["w2_sf"][e], weights["w2_gs"][e]).to(torch.bfloat16)
+        hh = xn[tok].float() @ W13.float().T
+        inter = (F.silu(hh[:, :D_EXPERT]) * hh[:, D_EXPERT:]).to(torch.bfloat16)
+        ref = inter.float() @ W2.float().T
+        got = y[rrow[tok, slot].long()].float()
+        msg.append(f"e{e}:n{len(tok)}:{float((got - ref).norm() / ref.norm()):.4f}")
+    print("SELFTEST moe rel err", " ".join(msg), flush=True)
+    # timing
+    for name, (T, counts) in SCEN.items():
+        lid, pos, cnt = _routes_from_counts(T, counts, dev)
+        p = torch.randn((T, D_EXPERT), device=dev).to(torch.bfloat16)
+        out = _moe_forward(st, p, lid, pos, cnt, T)
+        nt = int(out["ntiles"])
+        rows = int(out["tiles"][:nt, 2].sum())
+        R = sum(counts)
+        res = []
+        P1, P2 = 8, 16
+        t1 = _time(lambda: mod.moe_gemm(st["w13r"], out["xt"], out["tiles"], out["ntiles"], st["w13_gs"], out["inter"], 64, P1,
+                                        True, st["smem"]))
+        t2 = _time(lambda: mod.moe_gemm(st["w2r"], out["inter"], out["tiles"], out["ntiles"], st["w2_gs"], out["y"], 32, P2,
+                                        False, st["smem"]))
+        f1 = 2 * R * (2 * D_EXPERT) * D_EXPERT / t1 / 1e6  # GEMM1: [R, D_EXPERT] x [2*D_EXPERT, D_EXPERT]^T
+        f2 = 2 * R * D_EXPERT * D_EXPERT / t2 / 1e6  # GEMM2: [R, D_EXPERT] x [D_EXPERT, D_EXPERT]^T
+        res.append(f"P{P1}/{P2}: g1 {t1:.0f}us ({f1:.0f}TF) g2 {t2:.0f}us ({f2:.0f}TF)")
+        nsm = torch.cuda.get_device_properties(dev).multi_processor_count
+        rr = out["rrow"][out["rrow"] >= 0].long()
+        y0 = out["y"][rr].clone()
+        ctr = torch.zeros((2,), dtype=torch.int32, device=dev)
+        rows_t = torch.empty((LOCAL_EXPERTS,), dtype=torch.int32, device=dev)
+
+        def g1p():
+            ctr.zero_()
+            mod.moe_gemm_p(st["w13r"], out["xt"], out["tiles"], out["ntiles"], st["w13_gs"], out["inter"], 64, nsm, True,
+                           st["smem"], ctr[0:1])
+
+        def g2p():
+            ctr.zero_()
+            mod.moe_gemm_p(st["w2r"], out["inter"], out["tiles"], out["ntiles"], st["w2_gs"], out["y"], 32, nsm, False,
+                           st["smem"], ctr[1:2])
+        zb = torch.zeros((1 + out["tiles"].shape[0],), dtype=torch.int32, device=dev)
+
+        def gf():
+            zb.zero_()
+            mod.moe_fused(st["w13r"], st["w2r"], out["xt"], out["inter"], out["y"], out["tiles"], out["ntiles"], st["w13_gs"],
+                          st["w2_gs"], nsm, st["smem"], zb[0:1], zb[1:], st["moe_dbg"], st["moe_flags"], st["no_zero"],
+                          st["no_zero"], out["rrow"], lid, st["no_zero_f"], st["g_post_expert_norm"], st["no_zero_b"])
+        for order in (0, 1, 2):
+            mod.moe_plan(cnt, out["offsets"], out["tiles"], out["ntiles"], rows_t, order)
+            tf = _time(gf)
+            same_f = bool(torch.equal(out["y"][rr], y0))
+            res.append(f"fused o{order}: {tf:.0f}us same={same_f}")
+            t1 = _time(g1p)
+            t2 = _time(g2p)
+            f1 = 2 * R * 8192 * 4096 / t1 / 1e6
+            f2 = 2 * R * 4096 * 4096 / t2 / 1e6
+            same = bool(torch.equal(out["y"][rr], y0))
+            res.append(f"persist o{order}: g1 {t1:.0f}us ({f1:.0f}TF) g2 {t2:.0f}us ({f2:.0f}TF) same={same}")
+        tg = _time(lambda: mod.moe_gather(p, st["g_pre_expert_norm"], lid, pos, out["offsets"], cnt, out["xt"], out["rrow"]))
+        print(f"SELFTEST {name} R={R} padded={rows} tiles={nt} gather {tg:.0f}us |", " | ".join(res), flush=True)
+    a = torch.randn((16384, 8192), device=dev).to(torch.bfloat16)
+    tmm = _time(lambda: torch.mm(a, st["pooler"].t()))
+    print(f"SELFTEST cublas 16384x4096x8192 {tmm:.0f}us {2 * 16384 * D_EXPERT * HIDDEN / tmm / 1e6:.0f}TF", flush=True)
+    s = torch.randn((16384, 8192), device=dev)
+    o1 = torch.empty_like(s)
+    o2 = torch.empty((16384, 8192), device=dev, dtype=torch.bfloat16)
+    for nw in (4, 8, 16):
+        tb = _time(lambda: _boundary_kernel[(16384,)](a, s, st["g_post_ffn_norm"], st["a2"], st["b2"],
+                                             st["g_next_pre_attn_norm"], o1, o2, HAS_GPOST=True, H=HIDDEN, num_warps=nw))
+        print(f"SELFTEST boundary nw{nw} {tb:.0f}us {16384 * HIDDEN * 12 / tb / 1e6:.2f}TB/s", flush=True)
+    del a, s, o1, o2
+    torch.cuda.empty_cache()
+
+
+ATTN_SCEN = [
+    ("turn1_full", 1, 753, 80000, 0),
+    ("turn4_full", 4, 753, 80000, 0),
+    ("ft_full32k", 1, 16384, 32768, 0),
+    ("ft_full64k", 1, 16384, 65536, 0),
+    ("ft_slide", 1, 16384, 32768, 2048),
+]
+
+
+def _selftest_attn2(st):
+    if _fa3 is None:
+        return
+    dev = "cuda"
+    torch.manual_seed(2)
+    for name, B, L, ctx, window in ATTN_SCEN:
+        S = ctx + L
+        T = B * L
+        q8 = (torch.randn((T, HQ, HD), device=dev) * 0.7).to(FP8)
+        qkv = torch.randn((T, QKV_SIZE), device=dev).to(torch.bfloat16)
+        kc = (torch.randn((B * S, 1, HKV, HD), device=dev) * 0.8 + 0.4).to(FP8)
+        vc = torch.randn((B * S, 1, HKV, HD), device=dev).to(FP8)
+        perm = torch.randperm(B * S, device=dev).to(torch.int32)
+        data = {"k_cache": kc, "v_cache": vc, "page_table": perm.view(B, S), "seq_lens": torch.full((B,), ctx, dtype=torch.int32, device=dev),
+                "cache_seqlens": torch.full((B,), S, dtype=torch.int32, device=dev),
+                "cu_seqlens_q": torch.arange(0, T + 1, L, dtype=torch.int32, device=dev), "scheduler_metadata": None,
+                "k_scale": torch.tensor(1.0, device=dev), "v_scale": torch.tensor(1.0, device=dev)}
+        cfg = {"batch": B, "q_len": L, "window": window, "page_size": 1, "sm_scale": SYNTH_SM_SCALE,
+               "qk_scale_factor": SYNTH_QK_SCALE_FACTOR, "kv_scale": 1.0, "tokens": T}
+
+        def ref_fn():
+            return _attention_norm_gate(data, q8, qkv, cfg)
+        flops = 4.0 * HQ * HD * (B * L * (ctx if not window else min(ctx, window)) + B * L * L / 2)
+        try:
+            r = ref_fn()
+            t_ref = _time(ref_fn, reps=3)
+            res = [f"fa3+ng {t_ref:.0f}us ({flops / t_ref / 1e6:.0f}TF)"]
+        except Exception as exc:  # noqa: BLE001
+            print(f"SELFTEST attn2 {name} FA3 ERR {repr(exc)[:300]}", flush=True)
+            continue
+        for variant, nsplit in [(v, 1) for v in ATTN_VARIANTS] + [(v, _attn_splits(cfg, data, v, st["nsm"])) for v in (1, 9)]:
+            try:
+                o = _attn_custom(st, data, q8, qkv, cfg, nsplit=nsplit, variant=variant)
+                torch.cuda.synchronize()
+                err = float((o.float() - r.float()).norm() / r.float().norm())
+                t_own = _time(lambda: _attn_custom(st, data, q8, qkv, cfg, nsplit=nsplit, variant=variant), reps=3)
+                res.append(f"v{variant}s{nsplit} {t_own:.0f}us ({flops / t_own / 1e6:.0f}TF) err {err:.4f}")
+            except Exception as exc:  # noqa: BLE001
+                res.append(f"v{variant}s{nsplit} ERR {repr(exc)[:120]}")
+        print(f"SELFTEST attn2 {name}: " + " | ".join(res), flush=True)
+        del q8, qkv, kc, vc
+    torch.cuda.empty_cache()
+
+
+def _selftest_boundary(st):
+    dev = "cuda"
+    T = 16384
+    a = torch.randn((T, HIDDEN), device=dev).to(torch.bfloat16)
+    s = torch.randn((T, HIDDEN), device=dev)
+    o1 = torch.empty_like(s)
+    o2 = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+    o3 = torch.empty_like(s)
+    o4 = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+    _boundary_kernel[(T,)](a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], o1, o2,
+                           HAS_GPOST=True, H=HIDDEN, num_warps=16)
+    st["mod"].boundary(a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], o3, o4, True, st["no_zero"])
+    torch.cuda.synchronize()
+    d1 = float((o1 - o3).abs().max())
+    d2 = float((o2.float() - o4.float()).abs().max())
+    t1 = _time(lambda: _boundary_kernel[(T,)](a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"],
+                                            o1, o2, HAS_GPOST=True, H=HIDDEN, num_warps=16))
+    t2 = _time(lambda: st["mod"].boundary(a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"],
+                                         o3, o4, True, st["no_zero"]))
+    print(f"SELFTEST boundary triton {t1:.0f}us cuda {t2:.0f}us (diff {d1:.1e} {d2:.1e})", flush=True)
+    del a, s, o1, o2, o3, o4
+    torch.cuda.empty_cache()
+
+
+# --------------------------------------------------------------------------------------
+# Extension build + CUDA / C++ sources. VERBATIM: these five strings are
+# byte-identical to the submitted version (verified by hash during the
+# refactor -- see REFACTOR_NOTES.md). They are the tuned algorithm: the
+# grouped NVFP4 expert GEMMs, the boundary / route / combine / qk-prep
+# kernels, the own Hopper attention kernel, and the cuBLASLt glue.
+# Do not hand-edit them to "clean them up": any change here is a numerics
+# or performance change, not a refactor, and needs its own GPU gating.
+# The Python constants that must agree with defines inside _CUDA_SRC are
+# marked at their definitions (ATTN_ASTAGES, ATTN_SMEM).
+# --------------------------------------------------------------------------------------
+
+
+def _build(fast_scales=True):
+    cap = torch.cuda.get_device_capability()
+    arch = f"{cap[0]}{cap[1]}" + ("a" if cap[0] == 9 else "")
+    src = ("" if fast_scales else "#define MOE_FAST_SCALE 0\n") + _CUDA_SRC + GLUE
+    name = "okc_prefill_moe_" + hashlib.sha1((src + CPP + arch).encode()).hexdigest()[:16]
+    return load_inline(name, cpp_sources=CPP, cuda_sources=src,
+                       functions=["qk_prep", "moe_route", "moe_plan", "moe_gather", "moe_gather_plan", "moe_combine",
+                                  "moe_gemm", "moe_init", "moe_gemm_p", "moe_fused", "boundary", "boundary_rc",
+                                  "kv_gather", "attn_prep", "attn_fwd", "attn_init", "attn_set_prof"],
+                       extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}", "-std=c++20",
+                                          "--use_fast_math"])
+
+
+def _build_lt():
+    name = "okc_prefill_lt_" + hashlib.sha1((LT_GLUE + LT_CPP).encode()).hexdigest()[:16]
+    # Host-only code: compiled by the host compiler (no nvcc), linked against cuBLASLt.
+    return load_inline(name, cpp_sources=[LT_CPP, LT_GLUE],
+                       functions=["lt_plan", "lt_plan_sm", "lt_nalgo", "lt_info", "lt_run"],
+                       extra_cflags=["-O3", "-std=c++20"], extra_ldflags=["-lcublasLt"], with_cuda=True)
+
+
 CPP = r'''
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
@@ -727,8 +1689,6 @@ void k_attn_init(int smem) {
 #endif
 }
 '''
-
-
 
 _CUDA_SRC = r'''#define OKC_PDL 1
 // Grouped NVFP4 x BF16 expert GEMM for Muse Spark's MoE (one H200 = 32 local experts).
@@ -5870,17 +6830,6 @@ __global__ void __launch_bounds__(256) attn_combine2_kernel(const float* __restr
 }  // namespace okc_attn
 '''
 
-
-def _build(fast_scales=True):
-    cap = torch.cuda.get_device_capability()
-    arch = f"{cap[0]}{cap[1]}" + ("a" if cap[0] == 9 else "")
-    src = ("" if fast_scales else "#define MOE_FAST_SCALE 0\n") + _CUDA_SRC + GLUE
-    name = "okc_prefill_moe_" + hashlib.sha1((src + CPP + arch).encode()).hexdigest()[:16]
-    return load_inline(name, cpp_sources=CPP, cuda_sources=src, functions=["qk_prep", "moe_route", "moe_plan", "moe_gather", "moe_gather_plan", "moe_combine", "moe_gemm", "moe_init", "moe_gemm_p", "moe_fused", "boundary", "boundary_rc", "kv_gather", "attn_prep", "attn_fwd", "attn_init", "attn_set_prof"],
-                       extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}", "-std=c++20",
-                                          "--use_fast_math"])
-
-
 LT_CPP = r'''
 #include <torch/extension.h>
 int64_t lt_plan(int64_t M, int64_t N, int64_t K, bool out_f32, int64_t ws_bytes, int64_t max_algos);
@@ -5889,6 +6838,7 @@ int64_t lt_nalgo(int64_t id);
 std::vector<int64_t> lt_info(int64_t id, int64_t algo);
 void lt_run(int64_t id, int64_t algo, torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor ws);
 '''
+
 LT_GLUE = r'''
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
@@ -5959,878 +6909,7 @@ void lt_run(int64_t id, int64_t algo, torch::Tensor x, torch::Tensor w, torch::T
 '''
 
 
-def _lt_pin_index(lt, pid, pin):
-    """LT_PIN entry -> heuristic index: None (torch.mm), an int index (legacy), or a signature tuple (tile id, split-K,
-    reduction scheme, custom option) matched against each heuristic result's config read back from cuBLASLt; returns
-    -1 when no result matches (the caller then tunes as usual)."""
-    if pin is None:
-        return None
-    n = lt.lt_nalgo(pid)
-    if isinstance(pin, int):
-        return pin if pin < n else -1
-    for a in range(n):
-        info = list(lt.lt_info(pid, a))
-        if (info[0], info[1], info[6], info[8]) == tuple(pin):
-            return a
-    return -1
 
 
-def _build_lt():
-    name = "okc_prefill_lt_" + hashlib.sha1((LT_GLUE + LT_CPP).encode()).hexdigest()[:16]
-    # host-only code: compiled by the host compiler (no nvcc), linked against cuBLASLt
-    return load_inline(name, cpp_sources=[LT_CPP, LT_GLUE], functions=["lt_plan", "lt_plan_sm", "lt_nalgo", "lt_info", "lt_run"],
-                       extra_cflags=["-O3", "-std=c++20"], extra_ldflags=["-lcublasLt"], with_cuda=True)
 
 
-# dense GEMMs: name -> (state weight [N, K], fp32 output)
-LT_GEMMS = {"qkv": ("qkv_gate", False), "o": ("o", False), "router": ("router_hilo", True), "pooler": ("pooler", False),
-            "unpooler": ("unpooler", False)}
-LT_TOKENS = (753, 3012, 16384)  # token counts of the scored shapes; others use torch.mm
-# The router chain (GEMM, split-K reduce, top-8) runs on a side stream during the pooler GEMM. At small T the pooler
-# holds every SM, so the reduce and the top-8 kernel wait for the pooler's end and the top-8 lands on the critical path.
-# Sizing the pooler for (SMs - reserve) leaves those SMs to the router chain.
-POOL_SM_RESERVE = {}  # T -> SMs left free for the router chain (0 / absent: torch.mm or the tuned algorithm)
-
-
-def _tune_lt(st):
-    """Time cuBLASLt's heuristic algorithms for each dense GEMM at the scored token counts; keep one only where it
-    beats torch.mm (same library, different kernel choice)."""
-    lt = st["lt"]
-    dev = "cuda"
-    choice = {}
-    for T in LT_TOKENS:
-        for name, (wn, f32) in LT_GEMMS.items():
-            w = st[wn]
-            N, K = w.shape
-            x = (torch.randn((T, K), device=dev) * 0.5).to(torch.bfloat16)
-            odt = torch.float32 if f32 else torch.bfloat16
-            ref_fn = (lambda: torch.mm(x, w.t(), out_dtype=torch.float32)) if f32 else (lambda: torch.mm(x, w.t()))
-            ref = ref_fn().float()
-            t_ref = _time(ref_fn, reps=10)
-            if name == "router" and not ROUTER_LT:  # (the split-K pick steals the concurrent pooler's SMs)
-                del x
-                continue
-            out = torch.empty((T, N), dtype=odt, device=dev)
-            if name == "pooler" and POOL_SM_RESERVE.get(T, 0) > 0:
-                pid = lt.lt_plan_sm(T, N, K, f32, st["lt_ws"].numel(), 4, st["nsm"] - POOL_SM_RESERVE[T])
-                if lt.lt_nalgo(pid) > 0:
-                    lt.lt_run(pid, 0, x, w, out, st["lt_ws"])
-                    torch.cuda.synchronize()
-                    err = float((out.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-6))
-                    if err < 2e-2:
-                        choice[(T, name)] = (pid, 0)
-                        t = _time(lambda: lt.lt_run(pid, 0, x, w, out, st["lt_ws"]), reps=10)
-                        print(f"LT T={T} pooler sized for {st['nsm'] - POOL_SM_RESERVE[T]} SMs: {t:.1f}us alone (torch.mm {t_ref:.1f}us)", flush=True)
-                        del x, out
-                        continue
-            pid = lt.lt_plan(T, N, K, f32, st["lt_ws"].numel(), 32)
-            if (T, name) in LT_PIN:  # a fixed pick: no prepare-time race between near-equal algorithms
-                a = _lt_pin_index(lt, pid, LT_PIN[(T, name)])
-                if a != -1:  # -1: no heuristic result has the pinned signature -> time them as usual
-                    if a is not None:
-                        choice[(T, name)] = (pid, a)
-                    print(f"LT T={T} {name}: pinned {LT_PIN[(T, name)]} -> algo {a}", flush=True)
-                    del x, out
-                    continue
-                print(f"LT T={T} {name}: pinned signature {LT_PIN[(T, name)]} not offered; tuning instead", flush=True)
-            best = (t_ref, None)
-            for a in range(lt.lt_nalgo(pid)):
-                try:
-                    lt.lt_run(pid, a, x, w, out, st["lt_ws"])
-                    torch.cuda.synchronize()
-                    err = float((out.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-6))
-                    if not err < 2e-2:
-                        continue
-                    t = _time(lambda: lt.lt_run(pid, a, x, w, out, st["lt_ws"]), reps=10)
-                except Exception:  # noqa: BLE001
-                    continue
-                if t < best[0] * 0.97:
-                    best = (t, a)
-            if best[1] is not None:
-                choice[(T, name)] = (pid, best[1])
-            print(f"LT tune T={T} {name}: torch.mm {t_ref:.1f}us, best {best[0]:.1f}us algo {best[1]} of {lt.lt_nalgo(pid)}", flush=True)
-            del x, out
-    torch.cuda.empty_cache()
-    return choice
-
-
-def _mm(st, x, name, side=False):
-    """x [T, K] @ W[N, K]^T with the tuned cuBLASLt algorithm for this shape, else torch.mm."""
-    T = x.shape[0]
-    ch = st["lt_choice"].get((T, name)) if st.get("lt_choice") else None
-    wn, f32 = LT_GEMMS[name]
-    w = st[wn]
-    if ch is None:
-        return torch.mm(x, w.t(), out_dtype=torch.float32) if f32 else torch.mm(x, w.t())
-    out = torch.empty((T, w.shape[0]), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
-    st["lt"].lt_run(ch[0], ch[1], x, w, out, st["lt_ws_side"] if side else st["lt_ws"])
-    return out
-
-
-_SIDE_STREAM = []  # the side stream for the router GEMM + top-8 (created in prepare)
-
-
-def _codes(packed):
-    """uint8 [..., K/2] -> uint8 codes [..., K] (element 2i = low nibble)."""
-    lo = packed & 15
-    hi = packed >> 4
-    return torch.stack((lo, hi), dim=-1).flatten(-2)
-
-
-# nibble slot i (the old layout's 4i..4i+3) -> bit positions of (m0, m1, m2, sign) in the 32-bit word (see convert8)
-_CODE_POS = {3: (6, 7, 8, 15), 7: (22, 23, 24, 31), 2: (2, 3, 4, 11), 6: (18, 19, 20, 27),
-             1: (28, 29, 30, 5), 5: (12, 13, 14, 21), 0: (0, 1, 26, 9), 4: (16, 17, 10, 25)}  # MOE_DQ7 layout
-
-
-def _repack(w, sf, gated):
-    """w: uint8 [E, N, 2048]; sf: e4m3 [E, N, 256] -> uint8 [E, N/128, KS, WBLK]."""
-    E, N, _ = w.shape
-    NT = N // 128
-    dev = w.device
-    if gated:
-        nt = torch.arange(NT, device=dev).view(NT, 1, 1)
-        q = torch.arange(8, device=dev).view(1, 8, 1)
-        lr = torch.arange(16, device=dev).view(1, 1, 16)
-        perm = torch.where(lr < 8, 64 * nt + 8 * q + lr, 4096 + 64 * nt + 8 * q + lr - 8).reshape(-1)
-    else:
-        perm = torch.arange(N, device=dev)
-    out = torch.empty((E, NT, KS, WBLK), dtype=torch.uint8, device=dev)
-    sfu = sf.view(torch.uint8)
-    shifts = torch.tensor([3, 7, 1, 5, 2, 6, 0, 4], dtype=torch.int32, device=dev)  # (half, hk, b) order below
-    pos = torch.tensor([_CODE_POS[int(i)] for i in shifts.tolist()], dtype=torch.int64, device=dev)  # [8, 4]
-    for e in range(E):
-        c = _codes(w[e][perm]).to(torch.int32)  # [N, 4096]
-        # rows: [nt, wg, w, half, g]; k: [ks, j, hk, t, b]
-        c = c.view(NT, 2, 4, 2, 8, KS, 4, 2, 4, 2)
-        # -> [nt, ks, wg, w, g, t, j, half, hk, b]
-        c = c.permute(0, 5, 1, 2, 4, 8, 6, 3, 7, 9).reshape(NT, KS, 2, 4, 8, 4, 4, 8)
-        # nibble index for (half, hk, b): i = 3 - (half + 2*hk) + 4*b; flattened order (half, hk, b):
-        # (0,0,0)->3 (0,0,1)->7 (0,1,0)->1 (0,1,1)->5 (1,0,0)->2 (1,0,1)->6 (1,1,0)->0 (1,1,1)->4
-        # bit layout read by convert8 (rotate + mask per register): code bit b of the code in nibble slot i goes to
-        # bit _CODE_POS[i][b] (b: m0, m1, m2, sign)
-        cb = (c.to(torch.int64).unsqueeze(-1) >> torch.arange(4, device=dev)) & 1  # [..., 8, 4]
-        words = (cb << pos).sum((-1, -2)) & 0xFFFFFFFF
-        wbytes = torch.stack([(words >> (8 * i)) & 0xFF for i in range(4)], dim=-1).to(torch.uint8)
-        out[e, :, :, :4096] = wbytes.reshape(NT, KS, 4096)
-        s = sfu[e][perm].view(NT, 2, 4, 2, 8, KS, 4)  # rows [nt, wg, w, half, g]; cols [ks, j]
-        s = s.permute(0, 5, 1, 2, 4, 6, 3).reshape(NT, KS, 512)  # [nt, ks, wg, w, g, j, half]
-        out[e, :, :, 4096:] = s
-    return out
-
-
-# ----------------------------------------------------------------------------------------------
-# pieces
-# ----------------------------------------------------------------------------------------------
-
-def _attention_fallback(data, q8, cfg):
-    """Local (non-Hopper) attention over the paged FP8 cache, FP32 math. Testing only."""
-    B, L = cfg["batch"], cfg["q_len"]
-    page, window = cfg["page_size"], cfg["window"]
-    ks, vs = data["k_scale"].float(), data["v_scale"].float()
-    kf = data["k_cache"].view(-1, HKV, HD)
-    vf = data["v_cache"].view(-1, HKV, HD)
-    scale = cfg["sm_scale"] * cfg["qk_scale_factor"]
-    out = torch.empty((B * L, HQ, HD), dtype=torch.bfloat16, device=q8.device)
-    seq_lens = data["seq_lens"].tolist()
-    for b in range(B):
-        seq = seq_lens[b]
-        first = max(0, seq - window + 1) if window else 0
-        kp = torch.arange(first, seq + L, device=q8.device)
-        rows = data["page_table"][b].long()[kp // page] * page + kp % page
-        keys = kf[rows].float() * ks
-        vals = vf[rows].float() * vs
-        q = q8[b * L:(b + 1) * L].float()
-        for c in range(0, L, 1024):
-            qp = seq + torch.arange(c, min(c + 1024, L), device=q8.device)
-            vis = kp[None, :] <= qp[:, None]
-            if window:
-                vis &= kp[None, :] > qp[:, None] - window
-            qq = q[c:c + 1024].view(-1, HKV, HQ // HKV, HD)
-            att = torch.einsum("lkgd,skd->lkgs", qq, keys) * scale
-            att = att.masked_fill(~vis[:, None, None, :], float("-inf")).softmax(-1)
-            out[b * L + c: b * L + c + qq.shape[0]] = torch.einsum("lkgs,skd->lkgd", att, vals).reshape(-1, HQ, HD).to(torch.bfloat16)
-    return out
-
-
-def _attention(data, q8, cfg):
-    if _fa3 is None:
-        return _attention_fallback(data, q8, cfg)
-    window = cfg["window"]
-    scaled = cfg["kv_scale"] != 1.0
-    descale = {}
-    if scaled:
-        B = cfg["batch"]
-        descale = dict(k_descale=data["k_scale"].reshape(1, 1).expand(B, HKV),
-                       v_descale=data["v_scale"].reshape(1, 1).expand(B, HKV))
-    out = _fa3(q=q8.view(-1, HQ, HD), k_cache=data["k_cache"], v_cache=data["v_cache"],
-               page_table=data["page_table"], cache_seqlens=data["cache_seqlens"],
-               cu_seqlens_q=data["cu_seqlens_q"], max_seqlen_q=cfg["q_len"],
-               softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"], causal=True,
-               window_size=(window - 1, 0) if window else (-1, -1),
-               scheduler_metadata=data["scheduler_metadata"], **descale)
-    if isinstance(out, tuple):
-        out = out[0]
-    return out
-
-
-def _moe_forward(st, p, lid, pos, cnt, T, order=None, zb=None, cit=None):
-    """Routed experts on the pooler output p [T, 4096]: returns per-route rows y [rows, 4096] (bf16) and rrow. With cit
-    (dict: zc = [max tiles | 4] zeroed counters, tok = [2T + rows] ints, topw, out) the fused kernel also writes the
-    combined output (combine in the tail) and the caller skips the combine kernel."""
-    dev = p.device
-    mod = st["mod"]
-    maxrows = T * TOP_K + LOCAL_EXPERTS * 256
-    maxtiles = T * TOP_K // 32 + 64
-    offsets = torch.empty((LOCAL_EXPERTS,), dtype=torch.int32, device=dev)
-    rows = torch.empty((LOCAL_EXPERTS,), dtype=torch.int32, device=dev)
-    tiles = torch.empty((maxtiles, 4), dtype=torch.int32, device=dev)
-    ntiles = torch.empty((1,), dtype=torch.int32, device=dev)
-    large = T >= MOE_LARGE_T
-    mode = MOE_MODE_LARGE if large else MOE_MODE_SMALL
-    if order is None:
-        order = MOE_ORDER_LARGE if large else MOE_ORDER_SMALL
-    fine = 1 if (FINE_MIN_T and T >= FINE_MIN_T) else 0  # remainder tiles rounded to 32 rows (plan + kernel agree)
-    order = order | (fine << 8)
-    xt = torch.empty((maxrows, D_EXPERT), dtype=torch.bfloat16, device=dev)
-    rrow = torch.empty((T, TOP_K), dtype=torch.int32, device=dev)
-    if cit is not None and (not GATHER_PLAN or mode != "fused"):
-        raise RuntimeError("CIT needs the fused kernel and the gather+plan launch")
-    cz = cit["zc"] if cit is not None else st["no_zero"]
-    ctok = cit["tok"] if cit is not None else st["no_zero"]
-    if GATHER_PLAN:  # the gather kernel also writes the plan (one launch fewer)
-        mod.moe_gather_plan(p, st["g_pre_expert_norm"], lid, pos, cnt, xt, rrow, offsets, tiles, ntiles, rows, order, cz, ctok)
-    else:
-        mod.moe_plan(cnt, offsets, tiles, ntiles, rows, order)
-        mod.moe_gather(p, st["g_pre_expert_norm"], lid, pos, offsets, cnt, xt, rrow)
-    inter = torch.empty((maxrows, D_EXPERT), dtype=torch.bfloat16, device=dev)
-    y = torch.empty((maxrows, D_EXPERT), dtype=torch.bfloat16, device=dev)
-    if mode == "fused":
-        if zb is None:
-            zb = torch.zeros((1 + maxtiles,), dtype=torch.int32, device=dev)  # work counter + per-tile GEMM1 completion
-        mod.moe_fused(st["w13r"], st["w2r"], xt, inter, y, tiles, ntiles, st["w13_gs"], st["w2_gs"], st["nsm"] * (2 if SKINNY_TEST else 1), st["smem"],
-                      zb[0:1], zb[1:1 + maxtiles], st["moe_dbg"], st["moe_flags"] | (fine << 8), cz, ctok, rrow, lid,
-                      cit["topw"] if cit is not None else st["no_zero_f"], st["g_post_expert_norm"],
-                      cit["out"] if cit is not None else st["no_zero_b"])
-    elif mode == "persist":
-        ctr = torch.zeros((2,), dtype=torch.int32, device=dev)
-        mod.moe_gemm_p(st["w13r"], xt, tiles, ntiles, st["w13_gs"], inter, 64, st["nsm"], True, st["smem"], ctr[0:1])
-        mod.moe_gemm_p(st["w2r"], inter, tiles, ntiles, st["w2_gs"], y, 32, st["nsm"], False, st["smem"], ctr[1:2])
-    else:
-        mod.moe_gemm(st["w13r"], xt, tiles, ntiles, st["w13_gs"], inter, 64, P_GEMM1, True, st["smem"])
-        mod.moe_gemm(st["w2r"], inter, tiles, ntiles, st["w2_gs"], y, 32, P_GEMM2, False, st["smem"])
-    return dict(y=y, rrow=rrow, xt=xt, inter=inter, tiles=tiles, ntiles=ntiles, offsets=offsets)
-
-
-def kernel_fn(data, state):
-    st = state
-    cfg = data["config"]
-    T = cfg["tokens"]
-    dev = data["attn_input"].device
-    # --- attention ---
-    av = _attn_variant(st, cfg)
-    pre = None
-    split = av is not None and T <= PREP_SPLIT_MAX_T and PREP_SPLIT.get("slide" if cfg["window"] else "full", False)
-    if split and not PREP_SPLIT_AFTER:
-        pre = _attn_prep_old(st, data, cfg)
-    ev0 = None
-    if split and PREP_SPLIT_AFTER:
-        ev0 = torch.cuda.Event()
-        ev0.record()
-    qkv = _mm(st, data["attn_input"], "qkv")
-    if ev0 is not None:
-        pre = _attn_prep_old(st, data, cfg, ev0)
-    q8 = torch.empty((T, Q_SIZE), dtype=torch.uint8, device=dev)
-    if QK_PREP_CUDA:
-        st["mod"].qk_prep(qkv, data["positions"], data["cache_loc"], st["inv_freq"], q8, data["k_cache"].view(torch.uint8),
-                          data["v_cache"].view(torch.uint8), data["k_scale"], data["v_scale"], bool(cfg["rope_theta"]),
-                          cfg["kv_scale"] != 1.0)
-    else:
-      _qk_prep_kernel[(T,)](qkv, data["positions"], data["cache_loc"], st["inv_freq"], q8,
-                          data["k_cache"].view(torch.uint8), data["v_cache"].view(torch.uint8), data["k_scale"], data["v_scale"],
-                          ROPE=bool(cfg["rope_theta"]), SCALED=cfg["kv_scale"] != 1.0, num_warps=4,
-                          **(dict(PDL=True, launch_pdl=True) if TRITON_PDL else {}))
-    if av is not None:
-        ns = _attn_splits(cfg, data, av)
-        sk = ATTN_SK.get(_attn_class(cfg), 0)
-        if sk and av in (8, 43) and cfg["batch"] * ((cfg["q_len"] + 23) // 24) * 2 <= 1536:
-            ns = -sk
-        og = _attn_custom(st, data, q8, qkv, cfg, nsplit=ns, variant=av, pre=pre)
-    else:
-        att = _attention(data, q8.view(FP8), cfg)
-        og = torch.empty((T, Q_SIZE), dtype=torch.bfloat16, device=dev)
-        _norm_gate_kernel[(T,)](att, qkv, og, num_warps=4)
-    a = _mm(st, og, "o")
-    h = torch.empty((T, HIDDEN), dtype=torch.bfloat16, device=dev)
-    maxtiles = T * TOP_K // 32 + 64
-    use_cit = CIT and MOE_MODE_SMALL == "fused" and MOE_MODE_LARGE == "fused" and GATHER_PLAN
-    zlen = LOCAL_EXPERTS + 1 + maxtiles + ((maxtiles + 4) if use_cit else 0)  # counts | work | done | (CIT: done2 | head, tail, err, pad)
-    rc = T >= BND_CUDA_MIN and BND_RECOMPUTE and T >= BND_RC_MIN_T
-    if rc:  # the first boundary keeps only the branch's rms factor; the second rebuilds the fp32 stream from it
-        zb = torch.empty((zlen,), dtype=torch.int32, device=dev)
-        r1 = torch.empty((T,), dtype=torch.float32, device=dev)
-        st["mod"].boundary_rc(a, data["stream"], st["a1"], st["a1"], st["b1"], st["g_pre_ffn_norm"], data["stream"], h, 1, zb,
-                              a, r1, st["a1"], st["b1"])
-    elif T >= BND_CUDA_MIN:  # the boundary kernel also zeroes zb (counts | work counter | tile done)
-        stream1 = torch.empty((T, HIDDEN), dtype=torch.float32, device=dev)
-        zb = torch.empty((zlen,), dtype=torch.int32, device=dev)
-        st["mod"].boundary(a, data["stream"], st["a1"], st["a1"], st["b1"], st["g_pre_ffn_norm"], stream1, h, False, zb)
-    else:
-        stream1 = torch.empty((T, HIDDEN), dtype=torch.float32, device=dev)
-        zb = torch.zeros((zlen,), dtype=torch.int32, device=dev)
-        _boundary_kernel[(T,)](a, data["stream"], a, st["a1"], st["b1"], st["g_pre_ffn_norm"], stream1, h,
-                               HAS_GPOST=False, H=HIDDEN, num_warps=16)
-    # --- router + top-8 on a side stream, concurrent with the pooler GEMM ---
-    main = torch.cuda.current_stream()
-    side = _SIDE_STREAM[0]
-    serial = T <= ROUTER_SERIAL_MAX or T >= ROUTER_SERIAL_MIN
-    if serial:  # the router GEMM alone on all SMs first: cheaper than slowing the pooler down by sharing SMs with it
-        logits = _mm(st, h, "router")
-    side.wait_stream(main)
-    with torch.cuda.stream(side):
-        if not serial:
-            logits = _mm(st, h, "router", side=True)  # [T, 512] fp32: hi | lo partial logits
-        ids = torch.empty((T, TOP_K), dtype=torch.int32, device=dev)
-        topw = torch.empty((T, TOP_K), dtype=torch.float32, device=dev)
-        lid = torch.empty((T, TOP_K), dtype=torch.int32, device=dev)
-        pos = torch.empty((T, TOP_K), dtype=torch.int32, device=dev)
-        cnt = zb[:LOCAL_EXPERTS]
-        cit = None
-        if use_cit:  # tok_left (T) | combine queue (T) | row -> token map (rows)
-            ctok = torch.empty((2 * T + T * TOP_K + LOCAL_EXPERTS * 256,), dtype=torch.int32, device=dev)
-            cit = dict(zc=zb[LOCAL_EXPERTS + 1 + maxtiles:], tok=ctok, topw=topw)
-        st["mod"].moe_route(logits, st["router_bias"], data["local_start"], ids, topw, lid, pos, cnt,
-                            ctok[:T] if use_cit else st["no_zero"], ctok[T:2 * T] if use_cit else st["no_zero"])  # one warp per token
-    # --- experts ---
-    p = _mm(st, h, "pooler")
-    main.wait_stream(side)
-    moe = torch.empty((T, D_EXPERT), dtype=torch.bfloat16, device=dev)
-    if cit is not None:
-        cit["out"] = moe
-    ex = _moe_forward(st, p, lid, pos, cnt, T, zb=zb[LOCAL_EXPERTS:], cit=cit)
-    y, rrow = ex["y"], ex["rrow"]
-    if cit is not None:
-        pass  # combined in the fused kernel's tail
-    elif CUDA_COMBINE:  # one block per token, PDL (the per-expert scale is 1: st["ones32"])
-        st["mod"].moe_combine(y, rrow, lid, topw, st["g_post_expert_norm"], moe)
-    elif TRITON_PDL:
-        _combine_kernel[(T,)](y, rrow, lid, topw, st["ones32"], st["g_post_expert_norm"], moe, H=D_EXPERT, PDL=True, num_warps=8,
-                              launch_pdl=True)
-    else:
-        _combine_kernel[(T,)](y, rrow, lid, topw, st["ones32"], st["g_post_expert_norm"], moe, H=D_EXPERT,
-                              num_warps=COMBINE_NW_SMALL if T <= COMBINE_SMALL_T else 8)
-    f = _mm(st, moe, "unpooler")
-    stream2 = torch.empty((T, HIDDEN), dtype=torch.float32, device=dev)
-    hidden = torch.empty((T, HIDDEN), dtype=torch.bfloat16, device=dev)
-    # (a recompute-the-stream variant, _boundary2_kernel, ran at only 2.4 TB/s on the H200: 772 us vs 436 us at 16K)
-    if rc:
-        st["mod"].boundary_rc(f, data["stream"], st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], stream2, hidden, 2,
-                              st["no_zero"], a, r1, st["a1"], st["b1"])
-    elif T >= BND_CUDA_MIN:
-        st["mod"].boundary(f, stream1, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], stream2, hidden, True, st["no_zero"])
-    else:
-        _boundary_kernel[(T,)](f, stream1, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"],
-                               stream2, hidden, HAS_GPOST=True, H=HIDDEN, num_warps=16)
-    return hidden, stream2, ids
-
-
-# ----------------------------------------------------------------------------------------------
-# self-test / micro-benchmarks printed from prepare() (check runs only)
-# ----------------------------------------------------------------------------------------------
-
-SELFTEST = False
-
-SCEN = {
-    "T16384": (16384, [12547, 11910, 2820, 2392, 270, 242, 97, 60, 34, 16, 14, 2, 1, 1, 1]),
-    "T3012": (3012, [2277, 2191, 416, 400, 47, 37, 32, 11, 7, 5, 4, 3, 2, 1, 1]),
-    "T753": (753, [540, 529, 127, 108, 14, 6, 3, 3, 3, 2, 1, 1]),
-}
-
-
-def _routes_from_counts(T, counts, dev):
-    lid = torch.full((T, TOP_K), -1, dtype=torch.int32, device=dev)
-    pos = torch.zeros((T, TOP_K), dtype=torch.int32, device=dev)
-    r = 0
-    for e, c in enumerate(counts):
-        idx = torch.arange(r, r + c, device=dev)
-        lid.view(-1)[(idx % T) * TOP_K + idx // T] = e
-        pos.view(-1)[(idx % T) * TOP_K + idx // T] = torch.arange(c, device=dev, dtype=torch.int32)
-        r += c
-    cnt = torch.zeros(LOCAL_EXPERTS, dtype=torch.int32, device=dev)
-    cnt[: len(counts)] = torch.tensor(counts, dtype=torch.int32, device=dev)
-    return lid, pos, cnt
-
-
-_FLUSH = []
-
-
-def _time(fn, reps=5):
-    """Median time in us with a cold L2 (a read sweep over 256 MB before each call, like the judge's replays)."""
-    if not _FLUSH:
-        _FLUSH.append((torch.ones(128 << 20, dtype=torch.float16, device="cuda"), torch.zeros((), dtype=torch.float32, device="cuda")))
-    buf, sink = _FLUSH[0]
-    fn()
-    torch.cuda.synchronize()
-    ts = []
-    for _ in range(reps):
-        sink.copy_(buf.sum(dtype=torch.float32))
-        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        e0.record()
-        fn()
-        e1.record()
-        torch.cuda.synchronize()
-        ts.append(e0.elapsed_time(e1) * 1000)
-    ts.sort()
-    return ts[len(ts) // 2]
-
-
-def _selftest(st, weights):
-    from nvfp4 import dequantize
-    dev = weights["w13"].device
-    mod = st["mod"]
-    torch.manual_seed(0)
-    # correctness on a small skewed routing
-    T = 700
-    counts = [300, 200, 100, 60, 33, 17, 14, 5, 1]  # 14 -> N=16, 5 and 1 -> N=8 tiles (below FINE_MIN_T)
-    lid, pos, cnt = _routes_from_counts(T, counts, dev)
-    p = torch.randn((T, D_EXPERT), device=dev).to(torch.bfloat16)
-    gw = st["g_pre_expert_norm"]
-    out = _moe_forward(st, p, lid, pos, cnt, T)
-    y, rrow = out["y"], out["rrow"]
-    pf = p.float()
-    xn = (pf * torch.rsqrt(pf.pow(2).mean(-1, keepdim=True) + 1e-5) * (1.0 + gw.float())).to(torch.bfloat16)
-    msg = []
-    for e in range(len(counts)):
-        tok, slot = (lid == e).nonzero(as_tuple=True)
-        W13 = dequantize(weights["w13"][e], weights["w13_sf"][e], weights["w13_gs"][e]).to(torch.bfloat16)
-        W2 = dequantize(weights["w2"][e], weights["w2_sf"][e], weights["w2_gs"][e]).to(torch.bfloat16)
-        hh = xn[tok].float() @ W13.float().T
-        inter = (F.silu(hh[:, :D_EXPERT]) * hh[:, D_EXPERT:]).to(torch.bfloat16)
-        ref = inter.float() @ W2.float().T
-        got = y[rrow[tok, slot].long()].float()
-        msg.append(f"e{e}:n{len(tok)}:{float((got - ref).norm() / ref.norm()):.4f}")
-    print("SELFTEST moe rel err", " ".join(msg), flush=True)
-    # timing
-    for name, (T, counts) in SCEN.items():
-        lid, pos, cnt = _routes_from_counts(T, counts, dev)
-        p = torch.randn((T, D_EXPERT), device=dev).to(torch.bfloat16)
-        out = _moe_forward(st, p, lid, pos, cnt, T)
-        nt = int(out["ntiles"])
-        rows = int(out["tiles"][:nt, 2].sum())
-        R = sum(counts)
-        res = []
-        for P1, P2 in ((8, 16),):
-            t1 = _time(lambda: mod.moe_gemm(st["w13r"], out["xt"], out["tiles"], out["ntiles"], st["w13_gs"], out["inter"], 64, P1, True, st["smem"]))
-            t2 = _time(lambda: mod.moe_gemm(st["w2r"], out["inter"], out["tiles"], out["ntiles"], st["w2_gs"], out["y"], 32, P2, False, st["smem"]))
-            f1 = 2 * R * 8192 * 4096 / t1 / 1e6
-            f2 = 2 * R * 4096 * 4096 / t2 / 1e6
-            res.append(f"P{P1}/{P2}: g1 {t1:.0f}us ({f1:.0f}TF) g2 {t2:.0f}us ({f2:.0f}TF)")
-        nsm = torch.cuda.get_device_properties(dev).multi_processor_count
-        rr = out["rrow"][out["rrow"] >= 0].long()
-        y0 = out["y"][rr].clone()
-        ctr = torch.zeros((2,), dtype=torch.int32, device=dev)
-        rows_t = torch.empty((LOCAL_EXPERTS,), dtype=torch.int32, device=dev)
-
-        def g1p():
-            ctr.zero_()
-            mod.moe_gemm_p(st["w13r"], out["xt"], out["tiles"], out["ntiles"], st["w13_gs"], out["inter"], 64, nsm, True, st["smem"], ctr[0:1])
-
-        def g2p():
-            ctr.zero_()
-            mod.moe_gemm_p(st["w2r"], out["inter"], out["tiles"], out["ntiles"], st["w2_gs"], out["y"], 32, nsm, False, st["smem"], ctr[1:2])
-        zb = torch.zeros((1 + out["tiles"].shape[0],), dtype=torch.int32, device=dev)
-
-        def gf():
-            zb.zero_()
-            mod.moe_fused(st["w13r"], st["w2r"], out["xt"], out["inter"], out["y"], out["tiles"], out["ntiles"], st["w13_gs"],
-                          st["w2_gs"], nsm, st["smem"], zb[0:1], zb[1:], st["moe_dbg"], st["moe_flags"], st["no_zero"], st["no_zero"],
-                          out["rrow"], lid, st["no_zero_f"], st["g_post_expert_norm"], st["no_zero_b"])
-        for order in (0, 1, 2):
-            mod.moe_plan(cnt, out["offsets"], out["tiles"], out["ntiles"], rows_t, order)
-            tf = _time(gf)
-            same_f = bool(torch.equal(out["y"][rr], y0))
-            res.append(f"fused o{order}: {tf:.0f}us same={same_f}")
-            t1 = _time(g1p)
-            t2 = _time(g2p)
-            f1 = 2 * R * 8192 * 4096 / t1 / 1e6
-            f2 = 2 * R * 4096 * 4096 / t2 / 1e6
-            same = bool(torch.equal(out["y"][rr], y0))
-            res.append(f"persist o{order}: g1 {t1:.0f}us ({f1:.0f}TF) g2 {t2:.0f}us ({f2:.0f}TF) same={same}")
-        tg = _time(lambda: mod.moe_gather(p, st["g_pre_expert_norm"], lid, pos, out["offsets"], cnt, out["xt"], out["rrow"]))
-        print(f"SELFTEST {name} R={R} padded={rows} tiles={nt} gather {tg:.0f}us |", " | ".join(res), flush=True)
-    a = torch.randn((16384, 8192), device=dev).to(torch.bfloat16)
-    tmm = _time(lambda: torch.mm(a, st["pooler"].t()))
-    print(f"SELFTEST cublas 16384x4096x8192 {tmm:.0f}us {2 * 16384 * 4096 * 8192 / tmm / 1e6:.0f}TF", flush=True)
-    s = torch.randn((16384, 8192), device=dev)
-    o1 = torch.empty_like(s)
-    o2 = torch.empty((16384, 8192), device=dev, dtype=torch.bfloat16)
-    for nw in (4, 8, 16):
-        tb = _time(lambda: _boundary_kernel[(16384,)](a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], o1, o2, HAS_GPOST=True, H=HIDDEN, num_warps=nw))
-        print(f"SELFTEST boundary nw{nw} {tb:.0f}us {16384 * 8192 * 12 / tb / 1e6:.2f}TB/s", flush=True)
-    del a, s, o1, o2
-    torch.cuda.empty_cache()
-
-
-ATTN_SCEN = [
-    ("turn1_full", 1, 753, 80000, 0),
-    ("turn4_full", 4, 753, 80000, 0),
-    ("ft_full32k", 1, 16384, 32768, 0),
-    ("ft_full64k", 1, 16384, 65536, 0),
-    ("ft_slide", 1, 16384, 32768, 2048),
-]
-
-
-def _selftest_attn():
-    if _fa3 is None:
-        return
-    dev = "cuda"
-    torch.manual_seed(1)
-    for name, B, L, ctx, window in ATTN_SCEN:
-        S = ctx + L
-        T = B * L
-        q = (torch.randn((T, HQ, HD), device=dev) * 0.5).to(FP8)
-        kc = torch.randn((B * S, 1, HKV, HD), device=dev).to(FP8)
-        vc = torch.randn((B * S, 1, HKV, HD), device=dev).to(FP8)
-        perm = torch.randperm(B * S, device=dev).to(torch.int32)
-        pt = perm.view(B, S)
-        seqlens = torch.full((B,), S, dtype=torch.int32, device=dev)
-        cuq = torch.arange(0, T + 1, L, dtype=torch.int32, device=dev)
-        kcont = kc.view(B * S, HKV, HD)[perm.long()].view(B, S, HKV, HD)
-        vcont = vc.view(B * S, HKV, HD)[perm.long()].view(B, S, HKV, HD)
-        ws = (window - 1, 0) if window else (-1, -1)
-        scale = 0.125 * 5.4730064863875
-        res = []
-        for label, kk, vv, ptab, extra in (
-            ("paged", kc, vc, pt, {}),
-            ("paged_pack", kc, vc, pt, dict(pack_gqa=True)),
-            ("contig", kcont, vcont, None, {}),
-            ("contig_pack", kcont, vcont, None, dict(pack_gqa=True)),
-        ):
-            try:
-                fn = lambda: _fa3(q=q, k_cache=kk, v_cache=vv, page_table=ptab, cache_seqlens=seqlens, cu_seqlens_q=cuq,
-                                  max_seqlen_q=L, softmax_scale=scale, causal=True, window_size=ws, **extra)
-                t = _time(fn, reps=3)
-                o = fn()
-                o = o[0] if isinstance(o, tuple) else o
-                res.append(f"{label} {t:.0f}us")
-                if label == "paged":
-                    ref = o.float()
-                else:
-                    res[-1] += f" d={float((o.float() - ref).abs().max()):.1e}"
-            except Exception as exc:  # noqa: BLE001
-                res.append(f"{label} ERR {str(exc)[:80]}")
-        tg = _time(lambda: kc.view(B * S, HKV, HD)[perm.long()], reps=3)
-        flops = 4.0 * HQ * HD * (B * L * (ctx if not window else min(ctx, window)) + B * L * L / 2)
-        print(f"SELFTEST attn {name} ({flops / 1e9:.0f} GF) gather {tg:.0f}us |", " | ".join(res), flush=True)
-        del q, kc, vc, kcont, vcont
-    torch.cuda.empty_cache()
-
-
-def _selftest_gemm(st):
-    dev = "cuda"
-    try:
-        import deep_gemm
-        names = [n for n in dir(deep_gemm) if not n.startswith("_")]
-        print("SELFTEST deep_gemm:", " ".join(names)[:1500], flush=True)
-    except Exception as exc:  # noqa: BLE001
-        deep_gemm = None
-        print("SELFTEST deep_gemm import failed", repr(exc)[:200], flush=True)
-    try:
-        import quack
-        import pkgutil
-        mods = [m.name for m in pkgutil.iter_modules(quack.__path__)]
-        print("SELFTEST quack:", " ".join(mods)[:800], flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print("SELFTEST quack import failed", repr(exc)[:200], flush=True)
-    shapes = [("qkv", 2304, 8192), ("o", 8192, 1024), ("pooler", 4096, 8192), ("unpooler", 8192, 4096)]
-    for T in (753, 3012, 16384):
-        line = []
-        for name, N, K in shapes:
-            a = torch.randn((T, K), device=dev).to(torch.bfloat16)
-            w = torch.randn((N, K), device=dev).to(torch.bfloat16)
-            t0 = _time(lambda: torch.mm(a, w.t()))
-            s = f"{name} cublas {t0:.0f}us ({2 * T * N * K / t0 / 1e6:.0f}TF)"
-            if deep_gemm is not None:
-                for fname in ("bf16_gemm_nt",):
-                    fn = getattr(deep_gemm, fname, None)
-                    if fn is None:
-                        continue
-                    try:
-                        out = torch.empty((T, N), device=dev, dtype=torch.bfloat16)
-                        fn(a, w, out)
-                        err = float((out.float() - (a @ w.t()).float()).abs().max())
-                        t1 = _time(lambda: fn(a, w, out))
-                        s += f" dg {t1:.0f}us ({2 * T * N * K / t1 / 1e6:.0f}TF, err {err:.1e})"
-                    except Exception as exc:  # noqa: BLE001
-                        s += f" dg ERR {str(exc)[:60]}"
-            line.append(s)
-        print(f"SELFTEST gemm T={T}: " + " | ".join(line), flush=True)
-    torch.cuda.empty_cache()
-
-
-import re as _re
-_m_ast = _re.search(r"#define ATTN_ASTAGES (\d+)", _CUDA_SRC[:2000])
-ATTN_SMEM = 1024 + 1024 + 4096 * 3 + (int(_m_ast.group(1)) if _m_ast else 4) * (8192 + 72 * 128)
-# own-kernel variants: (consumer warpgroups, exponentials per thread per tile on the FMA pipe)
-ATTN_VARIANTS = {0: (2, 0), 1: (2, 16), 8: (3, 0), 9: (3, 16), 16: (2, 0), 24: (3, 0), 43: (3, 0)}
-if "ATTN_NWG1" in _CUDA_SRC[:400]:
-    ATTN_VARIANTS[99] = (1, 0)  # timing experiment: a lone warpgroup
-if "ATTN_V52" in _CUDA_SRC[:400]:
-    ATTN_VARIANTS[52] = (2, 0)  # timing experiment: 2 warpgroups, two S buffers (PIPE2)
-if "ATTN_V53" in _CUDA_SRC[:400]:
-    ATTN_VARIANTS[53] = (2, 0)  # 2 warpgroups, two S sets, one P set, exp turns (PIPE3)  # 43: pipelined, exp turns  # 16, 24: QK(t+1) overlaps P.V(t); 32, 33: softmax(t) overlaps P.V(t-1)
-OWN_ATTN_LOCAL = False  # local (sm_80) runs use the FP32 fallback attention unless set
-
-
-ROUTER_SERIAL_MAX = 0  # T <= this: router GEMM on the main stream before the pooler
-COMBINE_NW_SMALL = 8  # Triton combine warps at T <= COMBINE_SMALL_T (occupancy: one wave of programs at 753)
-COMBINE_SMALL_T = 4096
-QK_PREP_CUDA = True  # (Oct 26 05:48: 16K -15 us, bit-identical but 3 of 3M q8 bytes, checks PASS) CUDA q/k prep (norm + RoPE + e4m3 + cache rows, PDL) instead of the Triton kernel
-CIT = False  # combine in the tail of the fused expert kernel (no combine launch); True also needs #define MOE_CIT 1 (dead: TRICKS 5.16)
-ATTN_SK = {"slide": 0, "full_long": 0, "full_short": 0, "full_batch": 0}  # stream-K attention grid per class (0: off)
-PREP_SPLIT_MAX_T = 1024  # stage the cache-only attention tiles on the side stream during the qkv GEMM (T=753: 6 idle SMs)
-PREP_SPLIT = {"slide": False, "full": False}  # Oct 26 04:56: +14 us at 753 sliding (side branch captured first)
-PREP_SPLIT_AFTER = True  # capture the side branch after the qkv GEMM node (forked from an event recorded before it)
-LT_PIN = {(753, "router"): (33, 4, 2, 3), (16384, "o"): (201, 1, 0, 2), (16384, "unpooler"): (201, 1, 0, 2),
-          (16384, "pooler"): (29, 1, 0, 1)}  # signatures (tile id, split-K, reduction, custom option): 753 router =
-# nvjet 128x96 1x2 split-K (v89c's judge draw), 16K o/unpooler = 176x128 1x2, 16K pooler = 128x160 2x1 (Oct 26: indices
-# 6/6/6/5 on the pod and on the judge alike; v113 pinned the router to #4 = 64x152 4x1 split-K by mistake)  # (T, gemm) -> cuBLASLt heuristic index (None: torch.mm), instead of the prepare-time race (Oct 26 search r28/r29: 16K unpooler 6 +0.15%, pooler 5 +0.17% vs the tuner)
-ROUTER_LT = True  # False: the router GEMM always runs as torch.mm (no tuned split-K algorithm)
-ATTN_PF_MAX_T = 0  # tokens <= this: the attention kernel prefetches the o-proj weight into L2 (0: off)
-ROUTER_SERIAL_MIN = 1 << 30  # T >= this: the same (at 16K the router's first wave delays the pooler anyway)
-FINE_MIN_T = 2048  # from this token count the plan rounds remainder tiles to 32 rows (160/192 widths; fused kernel <1>)
-SKINNY_TEST = False  # with #define MOE_SKINNY_TEST 1: the fused MoE kernel at 2 CTAs/SM (small tiles only)
-COMBINE_PW_EARLY = tl.constexpr(False)  # Triton combine: norm weight loaded before the PDL wait
-CUDA_COMBINE = False  # CUDA combine kernel (PDL, COMB_GROUP routes in flight): slower than Triton at 753/3012 (+1..9 us)
-TRITON_PDL = False  # qk_prep and combine (Triton) launched with programmatic dependent launch too
-GATHER_PLAN = True  # plan folded into the gather kernel (block 0 writes the tile list)
-BND_RECOMPUTE = True  # second boundary rebuilds the fp32 stream (alpha1*s + beta1*a*r1) instead of a 32 KB/row round trip
-BND_RC_MIN_T = 8192  # ...from this token count (Oct 26 00:05 on v89c: 16K sliding -30 us, 753 +6.6 us, 3012 equal)
-BND_CUDA_MIN = 1  # token count from which the CUDA boundary kernel replaces the Triton one (v69: every T, +0.12%)
-ATTN_SPLIT_MODE = 1  # 0: fill two waves; 1: minimize waves / splits (wave-quantization aware)
-# own attention variant per shape class when it validates (None: time all variants in prepare). 43 (softmax(t) overlaps
-# P.V(t-1); the three warpgroups take turns on the exp2 units for the first 40 of their 64 exps) is ~4% faster than 8 on
-# long full attention (64K: 6979 vs 7309 us; 4 x 80K: 1485 vs 1552 us) and ~3% slower on sliding windows.
-ATTN_FIXED = {"slide": 8, "full_long": 43, "full_short": 43, "full_batch": 43}  # turn-1 full: 418 vs 430 us
-_NSM = [132]
-
-
-def _attn_splits(cfg, data, variant):
-    """Key-range splits so that small batches still fill the GPU (each split keeps >= 8 key tiles)."""
-    B, L, window = cfg["batch"], cfg["q_len"], cfg["window"]
-    qb = 8 * ATTN_VARIANTS[variant][0]
-    base = ((L + qb - 1) // qb) * 2 * B
-    nsm = _NSM[0]
-    if base >= 2 * nsm:
-        return 1
-    keys = (window + qb) if window else data["page_table"].shape[1] * cfg["page_size"]
-    nmax = max(1, min(16, (keys // 128) // 8))
-    if ATTN_SPLIT_MODE == 1:
-        best = None
-        for ns in range(1, nmax + 1):
-            cost = -(-base * ns // nsm) / ns + (0.02 if ns > 1 else 0.0)
-            if best is None or cost < best[0] - 1e-9:
-                best = (cost, ns)
-        return best[1]
-    ns = min((2 * nsm + base - 1) // base, nmax)
-    return max(1, min(ns, 16))
-
-
-def _synthetic_attn_case(B, L, ctx, window, page, seed):
-    dev = "cuda"
-    g = torch.Generator(device=dev)
-    g.manual_seed(seed)
-    S = ctx + L
-    npg = (S + page - 1) // page
-    T = B * L
-    q8 = (torch.randn((T, HQ, HD), device=dev, generator=g) * 0.7).to(FP8)
-    qkv = torch.randn((T, QKV_SIZE), device=dev, generator=g).to(torch.bfloat16)
-    kc = (torch.randn((B * npg, page, HKV, HD), device=dev, generator=g) * 0.8 + 0.3).to(FP8)  # [pages, page_size, 2, 64]
-    vc = torch.randn((B * npg, page, HKV, HD), device=dev, generator=g).to(FP8)
-    pt = torch.randperm(B * npg, device=dev, generator=g).to(torch.int32).view(B, npg)
-    data = {"k_cache": kc, "v_cache": vc, "page_table": pt, "seq_lens": torch.full((B,), ctx, dtype=torch.int32, device=dev),
-            "cache_seqlens": torch.full((B,), S, dtype=torch.int32, device=dev),
-            "cu_seqlens_q": torch.arange(0, T + 1, L, dtype=torch.int32, device=dev), "scheduler_metadata": None,
-            "k_scale": torch.tensor(1.0, device=dev), "v_scale": torch.tensor(1.0, device=dev)}
-    cfg = {"batch": B, "q_len": L, "window": window, "page_size": page, "sm_scale": 0.125, "qk_scale_factor": 5.4730064863875,
-           "kv_scale": 1.0, "tokens": T}
-    return data, cfg, q8, qkv
-
-
-def _attn_ref(data, cfg, q8, qkv):
-    T = cfg["tokens"]
-    att = _attention(data, q8, cfg)
-    og = torch.empty((T, Q_SIZE), dtype=torch.bfloat16, device=q8.device)
-    _norm_gate_kernel[(T,)](att, qkv, og, num_warps=4)
-    return og
-
-
-def _validate_attn(st, variants):
-    """Check own-kernel variants against the reference attention path on small synthetic cases; returns the
-    variants that agree."""
-    worst = {v: 0.0 for v in variants}
-    for i, (B, L, ctx, window, page) in enumerate(((2, 300, 1000, 0, 1), (1, 400, 3000, 256, 1), (2, 100, 200, 0, 64))):
-        data, cfg, q8, qkv = _synthetic_attn_case(B, L, ctx, window, page, 7 + i)
-        ref = _attn_ref(data, cfg, q8, qkv).float()
-        for v in variants:
-            for ns in (1, 3):
-                o = _attn_custom(st, data, q8, qkv, cfg, nsplit=ns, variant=v).float()
-                err = float((o - ref).norm() / ref.norm())
-                worst[v] = max(worst[v], err if err == err else 1e9)
-    ok = [v for v in variants if worst[v] < 0.03]
-    print("ATTN own kernel validation (worst rel err):", {v: round(e, 4) for v, e in worst.items()}, "->", ok, flush=True)
-    return ok
-
-
-def _tune_attn(st, variants):
-    """Pick, per attention shape class, the fastest of the reference path and the validated own variants."""
-    choice = {}
-    # the scored shapes themselves (synthetic data): sliding 16K chunk, full 16K chunk at 32K context, turn 1 / turn 4 full
-    for kind, (B, L, ctx, window) in (("slide", (1, 16384, 32768, 2048)), ("full_long", (1, 16384, 32768, 0)),
-                                      ("full_short", (1, 753, 80000, 0)), ("full_batch", (4, 753, 80000, 0))):
-        data, cfg, q8, qkv = _synthetic_attn_case(B, L, ctx, window, 1, 11)
-        res = {"ref": _time(lambda: _attn_ref(data, cfg, q8, qkv), reps=5)}
-        for v in variants:
-            ns = _attn_splits(cfg, data, v)
-            res[v] = _time(lambda: _attn_custom(st, data, q8, qkv, cfg, nsplit=ns, variant=v), reps=5)
-        best = min(res, key=res.get)
-        choice[kind] = None if best == "ref" else best
-        print(f"ATTN tune {kind}: " + " ".join(f"{k}={t:.0f}us" for k, t in res.items()) + f" -> {best}", flush=True)
-        del data, q8, qkv
-    torch.cuda.empty_cache()
-    return choice
-
-
-def _attn_class(cfg):
-    if cfg["window"]:
-        return "slide"
-    if cfg["tokens"] > 4096:
-        return "full_long"
-    return "full_batch" if cfg["batch"] > 1 else "full_short"
-
-
-def _attn_variant(st, cfg):
-    ch = st.get("attn_choice")
-    if not ch:
-        return None
-    if cfg["window"]:
-        return ch["slide"]
-    if cfg["tokens"] > 4096:
-        return ch["full_long"]
-    return ch["full_batch"] if cfg["batch"] > 1 else ch["full_short"]
-
-
-def _attn_stage_buffers(data, cfg, dev):
-    B, L, window, page = cfg["batch"], cfg["q_len"], cfg["window"], cfg["page_size"]
-    smax = (window - 1 + L) if window else data["page_table"].shape[1] * page
-    ntk = (smax + 127) // 128
-    kt = torch.empty((B, 2, ntk, 128 * 64), dtype=torch.uint8, device=dev)
-    vt = torch.empty((B, 2, ntk, 72 * 128), dtype=torch.uint8, device=dev)
-    return ntk, kt, vt
-
-
-def _attn_prep_old(st, data, cfg, ev=None):
-    """Stage the tiles made only of keys already in the cache on the side stream (it needs nothing from this call's
-    qk_prep, so it overlaps the qkv GEMM's idle SMs); _attn_custom stages the rest after joining it. With `ev` (an
-    event recorded before the qkv GEMM was enqueued) the side branch is captured after the GEMM node."""
-    main, side = torch.cuda.current_stream(), _SIDE_STREAM[0]
-    pre = _attn_stage_buffers(data, cfg, data["attn_input"].device)
-    if ev is not None:
-        side.wait_event(ev)
-    else:
-        side.wait_stream(main)
-    with torch.cuda.stream(side):
-        st["mod"].attn_prep(data["k_cache"].view(torch.uint8), data["v_cache"].view(torch.uint8), data["page_table"],
-                            data["seq_lens"], cfg["page_size"], cfg["q_len"], cfg["window"], pre[0], pre[1], pre[2], 1)
-    return pre
-
-
-def _attn_custom(st, data, q8, qkv, cfg, nsplit=1, variant=0, pre=None):
-    """FP8 attention (own kernel) with the output norm * sigmoid(gate) fused: returns og [T, 1024] bf16."""
-    B, L, window, page = cfg["batch"], cfg["q_len"], cfg["window"], cfg["page_size"]
-    dev = q8.device
-    if pre is not None:  # part 1 was issued on the side stream by _attn_prep_old: join it, then stage the rest
-        ntk, kt, vt = pre
-        torch.cuda.current_stream().wait_stream(_SIDE_STREAM[0])
-    else:
-        ntk, kt, vt = _attn_stage_buffers(data, cfg, dev)
-    st["mod"].attn_prep(data["k_cache"].view(torch.uint8), data["v_cache"].view(torch.uint8), data["page_table"],
-                        data["seq_lens"], page, L, window, ntk, kt, vt, 2 if pre is not None else 0)
-    out = torch.empty((B * L, Q_SIZE), dtype=torch.bfloat16, device=dev)
-    c = cfg["sm_scale"] * cfg["qk_scale_factor"] * cfg["kv_scale"] * 1.4426950408889634
-    if nsplit < 0:  # stream-K over -nsplit CTAs: int header (W, pair prefix, first pairs) + npairs + G partial slots
-        G, nqb = -nsplit, (L + 23) // 24
-        hdr = (2 + B * nqb * 2 + 1 + G + 63) // 64 * 64
-        ws = torch.empty((hdr + (B * nqb * 2 + G) * 24 * 8 * 66,), dtype=torch.float32, device=dev)
-    else:
-        ws = torch.empty((nsplit, B * L, HQ, 66), dtype=torch.float32, device=dev) if nsplit > 1 else out
-    pf = st["o"] if B * L <= ATTN_PF_MAX_T else st["no_pf"]  # o-proj weight into L2 during the attention
-    st["mod"].attn_fwd(q8.view(torch.uint8), kt, vt, data["seq_lens"], qkv, out, L, window, ntk, c, cfg["kv_scale"],
-                       st["attn_smem"], nsplit, ws, variant, pf)
-    return out
-
-
-def _selftest_attn2(st):
-    if _fa3 is None:
-        return
-    dev = "cuda"
-    torch.manual_seed(2)
-    for name, B, L, ctx, window in ATTN_SCEN:
-        S = ctx + L
-        T = B * L
-        q8 = (torch.randn((T, HQ, HD), device=dev) * 0.7).to(FP8)
-        qkv = torch.randn((T, QKV_SIZE), device=dev).to(torch.bfloat16)
-        kc = (torch.randn((B * S, 1, HKV, HD), device=dev) * 0.8 + 0.4).to(FP8)
-        vc = torch.randn((B * S, 1, HKV, HD), device=dev).to(FP8)
-        perm = torch.randperm(B * S, device=dev).to(torch.int32)
-        data = {"k_cache": kc, "v_cache": vc, "page_table": perm.view(B, S), "seq_lens": torch.full((B,), ctx, dtype=torch.int32, device=dev),
-                "cache_seqlens": torch.full((B,), S, dtype=torch.int32, device=dev),
-                "cu_seqlens_q": torch.arange(0, T + 1, L, dtype=torch.int32, device=dev), "scheduler_metadata": None,
-                "k_scale": torch.tensor(1.0, device=dev), "v_scale": torch.tensor(1.0, device=dev)}
-        cfg = {"batch": B, "q_len": L, "window": window, "page_size": 1, "sm_scale": 0.125, "qk_scale_factor": 5.4730064863875,
-               "kv_scale": 1.0, "tokens": T}
-        def ref_fn():
-            att = _attention(data, q8, cfg)
-            og = torch.empty((T, Q_SIZE), dtype=torch.bfloat16, device=dev)
-            _norm_gate_kernel[(T,)](att, qkv, og, num_warps=4)
-            return og
-        flops = 4.0 * HQ * HD * (B * L * (ctx if not window else min(ctx, window)) + B * L * L / 2)
-        try:
-            r = ref_fn()
-            t_ref = _time(ref_fn, reps=3)
-            res = [f"fa3+ng {t_ref:.0f}us ({flops / t_ref / 1e6:.0f}TF)"]
-        except Exception as exc:  # noqa: BLE001
-            print(f"SELFTEST attn2 {name} FA3 ERR {repr(exc)[:300]}", flush=True)
-            continue
-        for variant, nsplit in [(v, 1) for v in ATTN_VARIANTS] + [(v, _attn_splits(cfg, data, v)) for v in (1, 9)]:
-            try:
-                o = _attn_custom(st, data, q8, qkv, cfg, nsplit=nsplit, variant=variant)
-                torch.cuda.synchronize()
-                err = float((o.float() - r.float()).norm() / r.float().norm())
-                t_own = _time(lambda: _attn_custom(st, data, q8, qkv, cfg, nsplit=nsplit, variant=variant), reps=3)
-                res.append(f"v{variant}s{nsplit} {t_own:.0f}us ({flops / t_own / 1e6:.0f}TF) err {err:.4f}")
-            except Exception as exc:  # noqa: BLE001
-                res.append(f"v{variant}s{nsplit} ERR {repr(exc)[:120]}")
-        print(f"SELFTEST attn2 {name}: " + " | ".join(res), flush=True)
-        del q8, qkv, kc, vc
-    torch.cuda.empty_cache()
-
-
-def _selftest_boundary(st):
-    dev = "cuda"
-    T = 16384
-    a = torch.randn((T, HIDDEN), device=dev).to(torch.bfloat16)
-    s = torch.randn((T, HIDDEN), device=dev)
-    o1 = torch.empty_like(s)
-    o2 = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
-    o3 = torch.empty_like(s)
-    o4 = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
-    _boundary_kernel[(T,)](a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], o1, o2, HAS_GPOST=True, H=HIDDEN, num_warps=16)
-    st["mod"].boundary(a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], o3, o4, True, st["no_zero"])
-    torch.cuda.synchronize()
-    d1 = float((o1 - o3).abs().max())
-    d2 = float((o2.float() - o4.float()).abs().max())
-    t1 = _time(lambda: _boundary_kernel[(T,)](a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], o1, o2, HAS_GPOST=True, H=HIDDEN, num_warps=16))
-    t2 = _time(lambda: st["mod"].boundary(a, s, st["g_post_ffn_norm"], st["a2"], st["b2"], st["g_next_pre_attn_norm"], o3, o4, True, st["no_zero"]))
-    print(f"SELFTEST boundary triton {t1:.0f}us cuda {t2:.0f}us (diff {d1:.1e} {d2:.1e})", flush=True)
-    del a, s, o1, o2, o3, o4
-    torch.cuda.empty_cache()
