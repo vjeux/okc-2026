@@ -193,8 +193,6 @@ CUDA_SRC = r'''
 // skinny ring (two variants: dynamic-pool SKDYN / static, see below) ->
 // fat stream (cp.async + mma.sync, wgmma variant) -> WS helper warp ->
 // WGS (RS-wgmma, producer/consumer) -> run_phase -> moe_fused ->
-// C++ launcher okc_run. Kernel bodies below are unchanged from v216x
-// except for the dead-code removals listed in REFACTOR_NOTES.md.
 // muse_moe_w4a16 v2: one persistent kernel: routing prologue, GEMM1+SwiGLU, GEMM2+norm stats, final norm/sum.
 #include <cuda_bf16.h>
 #include <type_traits>

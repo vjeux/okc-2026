@@ -5004,11 +5004,7 @@ def _num_sms7(device):
 
 # per-shape launch overrides measured on the judge's H200: (batch, q_len, sliding, kv pairs) -> plan fields
 _TUNED7 = {
-    # (Oct 26 14:16-14:21, podbench_multi 15 rounds x2: b32 q8 sliding at 4 splits per request -- 128 CTAs, one per SM --
-    # 16.10 -> 15.50 us; 3 splits +13%, 5 +10.6%, 6 +3.1%: since the faster per-request q8 loop (LATESYNCN, QKFIRST))
     (32, 8, True, 1): dict(n_splits=4, nc=1, coop=1),
-    # (Oct 26 14:44-14:48: b1 q1 full with the cooperative finalize over 8 copies: GPU-1 plan sweep -1.6%, podbench_multi
-    # 12 rounds 12.30 -> 12.00 us; coop with 1/2/4 copies +26/+16/+4%: same-address red serialization of 250 splits)
     (1, 1, False, 1): dict(nc=8, coop=1, n_splits=252),   # (experiment: 252 instead of 264 splits)
 }
 
@@ -5051,13 +5047,9 @@ def _plan7(B, pairs, L, window, max_pages, P, device):
             n = max(1, min(tiles, ((target * 21) // 22) // reqs))
             return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=max(1, min(n, 8)))
         n = max(1, min(tiles, target // reqs))
-        # (q_len 1: the last CTA finalizes, over 4 workspace copies -- Oct 26 00:26, f1 per-request: coop 13.0-13.1 us,
-        # last-CTA 12.6-12.9, one copy 15.2, two 14.0, eight 12.9-13.2; the flat kernel 13.6)
         return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=max(1, min(n, 4)), coop=0)
     if L == 1 and reqs < 24:
         # judge timings: plain split-KV with one tile per CTA and a single workspace copy beats clusters here
-        # (Oct 25 21:36, after the cheaper merges: b1 33 splits (one tile each) 6.6 -> 6.5 us vs 32, b16 16 splits
-        # 9.4 -> 9.2 us vs 12)
         n = max(1, min(tiles, target // reqs))
         return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=1)
     if L == 8 and reqs < 16 and OKC_PLAIN8:
