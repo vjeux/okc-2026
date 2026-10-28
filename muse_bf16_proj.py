@@ -151,12 +151,6 @@ CUDA_SRC = r"""
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-__device__ __forceinline__ uint4 ldg_stream(const uint4* p) {
-  uint4 r;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
-  return r;
-}
 
 __device__ __forceinline__ void ldsm_x4(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -217,13 +211,8 @@ __device__ __forceinline__ void mbar_init(uint32_t bar, int count) {
 }
 __device__ __forceinline__ bool mbar_test(uint32_t bar, uint32_t parity) {
   uint32_t ok;
-#if __CUDA_ARCH__ >= 900
   asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}\n"
                : "=r"(ok) : "r"(bar), "r"(parity) : "memory");
-#else
-  asm volatile("{\n .reg .pred p;\n mbarrier.test_wait.parity.shared.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}\n"
-               : "=r"(ok) : "r"(bar), "r"(parity) : "memory");
-#endif
   return ok != 0;
 }
 __device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
@@ -238,15 +227,11 @@ __device__ __forceinline__ float esc_delta(uint32_t t, uint32_t bq) {
 }
 // wait with a suspend-time hint: the warp sleeps in hardware until the phase completes instead of re-polling
 __device__ __forceinline__ void mbar_wait_sleep(uint32_t bar, uint32_t parity) {
-#if __CUDA_ARCH__ >= 900
   uint32_t ok = 0;
   do {
     asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2, %3;\n selp.u32 %0, 1, 0, p;\n}\n"
                  : "=r"(ok) : "r"(bar), "r"(parity), "r"(0x989680u) : "memory");
   } while (!ok);
-#else
-  mbar_wait(bar, parity);
-#endif
 }
 __device__ __forceinline__ void mbar_arrive(uint32_t bar) {
   asm volatile("{\n .reg .b64 st;\n mbarrier.arrive.shared.b64 st, [%0];\n}\n" :: "r"(bar) : "memory");
@@ -254,7 +239,6 @@ __device__ __forceinline__ void mbar_arrive(uint32_t bar) {
 __device__ __forceinline__ void named_bar(int id, int n) {
   asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory");
 }
-#if __CUDA_ARCH__ >= 900
 __device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
   asm volatile("{\n .reg .b64 st;\n mbarrier.arrive.expect_tx.shared.b64 st, [%0], %1;\n}\n" :: "r"(bar), "r"(bytes) : "memory");
 }
@@ -278,7 +262,6 @@ __device__ __forceinline__ void mbar_wait_cluster(uint32_t bar, uint32_t parity)
                  " selp.u32 %0, 1, 0, p;\n}\n" : "=r"(ok) : "r"(bar), "r"(parity) : "memory");
   } while (!ok);
 }
-#endif
 
 """
 
@@ -289,11 +272,6 @@ __device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.s
 template <int N> __device__ __forceinline__ void wg_wait() { asm volatile("wgmma.wait_group.sync.aligned %0;" :: "n"(N) : "memory"); }
 __device__ __forceinline__ void fence_async_smem() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
 
-__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, int src_bytes) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(src_bytes) : "memory");
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
-template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory"); }
 
 // smem matrix descriptor: K-major, 128B swizzle, SBO = 1024 B (8 rows x 128 B)
 __device__ __forceinline__ uint64_t make_desc_sw128(uint32_t saddr) {
@@ -337,15 +315,12 @@ TMA_SRC = r"""
 // Weights: per-warp contiguous layout, uncompressed [nrg][S][32][16B], compressed [nrg][S/4][3][32][16B].
 // One stage = KS k-steps (uncompressed) or KS/4 units (compressed) for every consumer warp.
 // Warps 0..NW-1 consume, warp NW produces (one elected lane issues bulk copies on sm_90;
-// on sm_80 all 32 producer lanes issue 16-byte cp.async and arrive with cp.async.mbarrier.arrive).
 template <int MT, int RG, int WS, int KS, int NSTAGE, bool COMP, bool HL, bool WGM, typename OutT>
 __global__ void __launch_bounds__((RG * WS + 1) * 32, 1)
 skinny_tma_kernel(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict__ x,
                   OutT* __restrict__ out, float* __restrict__ ws, int* __restrict__ counters,
                   const int2* __restrict__ ptab, int pmax, uint32_t base4,
                   int M, int N, int Kp, int Kx, int splits, int nrg, int dist, int dg) {
-  // dg (diagnostics only, 0 in production): 1 = skip epilogue, 2 = also skip x / escape-table loads,
-  // 3 = also skip all compute (pure weight streaming through the pipeline)
   constexpr int NW = RG * WS;
   constexpr int NC = NW * 32;                       // consumer threads
   constexpr int TOK = MT * 8;
@@ -383,48 +358,32 @@ skinny_tma_kernel(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict_
 
   if (threadIdx.x == 0) {
     for (int i = 0; i < NSTAGE; ++i) {
-#if __CUDA_ARCH__ >= 900
       mbar_init(full0 + 8 * i, 1);
-#else
-      mbar_init(full0 + 8 * i, 32);
-#endif
       mbar_init(empty0 + 8 * i, NW);
     }
     for (int i = 0; i < XP; ++i) mbar_init(xbar0 + 8 * i, NC);
-#if __CUDA_ARCH__ >= 900
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     // first stages go out right away (no wait for the CTA barrier)
     for (int st = 0; st < NSTAGE && st < nst; ++st) {
       mbar_expect_tx(full0 + 8 * st, SLOT);
       bulk_g2s(ring + st * SLOT, wsrc + (size_t)st * SLOT, SLOT, full0 + 8 * st);
     }
-#endif
   }
   if (!WGM && threadIdx.x < 4) reinterpret_cast<uint32_t*>(xs + M * XS)[threadIdx.x] = 0u;  // zero row
   __syncthreads();
 
   if (warp == NW) {
     // ---------------- producer: this CTA's weight stream is contiguous
-#if __CUDA_ARCH__ >= 900
     const int st0 = NSTAGE < nst ? NSTAGE : nst;   // already issued by thread 0
-#else
-    const int st0 = 0;
-#endif
     for (int st = st0; st < nst; ++st) {
       const int slot = st % NSTAGE;
       if (st >= NSTAGE) mbar_wait(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);
       const uint32_t dst = ring + slot * SLOT;
       const char* src = wsrc + (size_t)st * SLOT;
-#if __CUDA_ARCH__ >= 900
       if (lane == 0) {
         mbar_expect_tx(full0 + 8 * slot, SLOT);
         bulk_g2s(dst, src, SLOT, full0 + 8 * slot);
       }
-#else
-      for (int off = lane * 16; off < SLOT; off += 512)
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst + off), "l"(src + off) : "memory");
-      asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" :: "r"(full0 + 8 * slot) : "memory");
-#endif
     }
     return;
   }
@@ -495,9 +454,7 @@ skinny_tma_kernel(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict_
       if (need > xp_ready && dg < 2) {
         mbar_wait(xbar0 + 8 * need, 0);
         xp_ready = need;
-#if __CUDA_ARCH__ >= 900
         if constexpr (WGM) fence_async_smem();   // cp.async (generic proxy) writes -> wgmma (async proxy) reads
-#endif
       }
     }
     mbar_wait(full0 + 8 * slot, (st / NSTAGE) & 1);
@@ -512,10 +469,6 @@ skinny_tma_kernel(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict_
     }
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * slot);
-    if (dg == 3) {
-      if (wr[0].x == 0x9e3779b9u && wr[NL - 1].w == 0x7f4a7c15u) acc[0][0] += 1.f;   // keep the loads
-      continue;
-    }
     if constexpr (!COMP && HL) {
 #pragma unroll
       for (int j2 = 0; j2 < KS; j2 += 2) {
@@ -549,7 +502,6 @@ skinny_tma_kernel(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict_
         }
       }
     } else if constexpr (WGM) {
-#if __CUDA_ARCH__ >= 900
 #pragma unroll
       for (int u = 0; u < KS / 4; ++u) {
         const uint4 L0 = wr[3 * u], L1 = wr[3 * u + 1], C = wr[3 * u + 2];
@@ -571,31 +523,6 @@ skinny_tma_kernel(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict_
           for (int q = 0; q < 4; ++q) asm volatile("" : "+r"(afrag[0][q]), "+r"(afrag[1][q]) :: "memory");
         }
       }
-#else
-      // sm_80 check path: same data layout, mma.sync with B fragments read from the swizzled x tile
-      const int g8 = lane >> 2, t8 = lane & 3;
-#pragma unroll
-      for (int u = 0; u < KS / 4; ++u) {
-        const uint4 L0 = wr[3 * u], L1 = wr[3 * u + 1], C = wr[3 * u + 2];
-        const int kl = kw0 + (st * KS + u * 4) * 16;
-        const unsigned char* tile = reinterpret_cast<const unsigned char*>(xs) + (kl >> 6) * TOK * 128;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          uint32_t af[4];
-          decode8(j < 2 ? (j == 0 ? L0.x : L0.z) : (j == 2 ? L1.x : L1.z),
-                  j < 2 ? (j == 0 ? L0.y : L0.w) : (j == 2 ? L1.y : L1.w),
-                  j == 0 ? C.x : j == 1 ? C.y : j == 2 ? C.z : C.w, base4, af);
-#pragma unroll
-          for (int jj = 0; jj < MT; ++jj) {
-            const int tok = jj * 8 + g8;
-            const unsigned char* row = tile + tok * 128;
-            const uint32_t b0 = *reinterpret_cast<const uint32_t*>(row + (((2 * j) ^ (tok & 7)) << 4) + 4 * t8);
-            const uint32_t b1 = *reinterpret_cast<const uint32_t*>(row + (((2 * j + 1) ^ (tok & 7)) << 4) + 4 * t8);
-            mma_bf16(wacc + 4 * jj, af[0], af[1], af[2], af[3], b0, b1);
-          }
-        }
-      }
-#endif
     } else {
 #pragma unroll
       for (int u = 0; u < KS / 4; ++u) {
@@ -622,21 +549,15 @@ skinny_tma_kernel(const uint4* __restrict__ Wp, const __nv_bfloat16* __restrict_
       }
     }
   }
-#if __CUDA_ARCH__ >= 900
   if constexpr (WGM) {
     wg_wait<0>();
 #pragma unroll
     for (int q = 0; q < TOK / 2; ++q) asm volatile("" : "+f"(wacc[q]) :: "memory");
   }
-#endif
 
   if constexpr (WGM) {
 #pragma unroll
     for (int j = 0; j < MT; ++j) { acc[j][0] = wacc[4 * j]; acc[j][1] = wacc[4 * j + 1]; acc[j][2] = wacc[4 * j + 2]; acc[j][3] = wacc[4 * j + 3]; }
-  }
-  if (dg >= 1) {
-    if (acc[0][0] == 1.2345e-30f) out[threadIdx.x] = cvt_out<OutT>(acc[0][1]);
-    return;   // (the producer warp has already returned)
   }
   // per-warp partials -> shared memory: red[w][row16][TOK]
   {
@@ -804,11 +725,6 @@ void @@TMA_NAME@@(at::Tensor Wp, at::Tensor x, at::Tensor out, at::Tensor ws, at
 MAP_SRC = r"""
 #include <cudaTypedefs.h>
 #include <cstring>
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-__device__ __forceinline__ void tma_load_2d(uint32_t dst, const CUtensorMap* map, uint32_t bar, int c0, int c1) {
-  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];"
-               :: "r"(dst), "l"(map), "r"(bar), "r"(c0), "r"(c1) : "memory");
-}
 __device__ __forceinline__ void tma_load_2d_pol(uint32_t dst, const CUtensorMap* map, uint32_t bar, int c0, int c1, uint64_t pol) {
   asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%3, %4}], [%2], %5;"
                :: "r"(dst), "l"(map), "r"(bar), "r"(c0), "r"(c1), "l"(pol) : "memory");
@@ -823,7 +739,6 @@ __device__ __forceinline__ void tma_load_3d(uint32_t dst, const CUtensorMap* map
   asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5}], [%2];"
                :: "r"(dst), "l"(map), "r"(bar), "r"(c0), "r"(c1), "r"(c2) : "memory");
 }
-#endif
 static PFN_cuTensorMapEncodeTiled_v12000 get_encode() {
   static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
   if (!fn) {
@@ -912,9 +827,6 @@ gemm90_kernel(const __grid_constant__ CUtensorMap mapA, const __grid_constant__ 
         if (i >= STAGES) mbar_wait(empty0 + 8 * slot, ((i / STAGES) - 1) & 1);
         mbar_expect_tx(full0 + 8 * slot, ST_BYTES);
         const int kg = (kb0 + i) * 64;
-        if constexpr (AS)   // A tile pre-swizzled and contiguous: [rb][kb][BM x 128 B]
-          bulk_g2s(sbase + slot * ST_BYTES, Wst + ((size_t)rb * nkb_all + kb0 + i) * A_BYTES, A_BYTES, full0 + 8 * slot);
-        else
           tma_load_2d_ef(sbase + slot * ST_BYTES, &mapA, full0 + 8 * slot, kg, rb * BM);
         tma_load_2d_el(sbase + slot * ST_BYTES + A_BYTES, &mapB, full0 + 8 * slot, kg % Kx, 0);
       }
@@ -1048,52 +960,8 @@ void gemm90(at::Tensor W, at::Tensor Wst, at::Tensor x, at::Tensor out, at::Tens
 
 SK2_SRC = r"""
 
-#ifndef SK2_DELAY_ESC
-#define SK2_DELAY_ESC 0
-#endif
-#if SK2_DELAY_ESC
-// debug builds only: every ring wait of the escape and producer warps gives up after 2 s (globaltimer) with a trap, so
-// a wedged ring aborts the launch instead of hanging the GPU
-__device__ __forceinline__ void sk2_wait_dbg(uint32_t bar, uint32_t parity) {
-  unsigned long long t0;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
-  uint32_t ok = 0;
-  for (;;) {
-    asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2, %3;\n selp.u32 %0, 1, 0, p;\n}\n"
-                 : "=r"(ok) : "r"(bar), "r"(parity), "r"(1000u) : "memory");
-    if (ok) return;
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    if (t - t0 > 2000000000ull) {
-      printf("sk2 ring wedged: block %d warp %d bar 0x%x parity %u\n", (int)blockIdx.x, (int)(threadIdx.x >> 5), bar, parity);
-      __trap();
-    }
-  }
-}
-#define SK2_WAIT(bar, par) sk2_wait_dbg((bar), (par))
-// one (escape warp, stage) per CTA per launch stalls SK2_DELAY_ESC ns at the end of its stage step; the pair comes from a
-// hash of the launch's start time (read once per CTA by every escape warp from the same smem word) and the block index
-#define SK2_DELAY_HOOK(st_) do { if ((st_) == dly_st && ew == dly_w) { const unsigned long long t0_ = gtime(); \
-    while (gtime() - t0_ < (unsigned long long)SK2_DELAY_ESC) __nanosleep(500); } } while (0)
-#define SK2_DLY_SEED_DECL __shared__ unsigned long long sk2_dly_seed;
-#define SK2_DLY_SEED_SET() (sk2_dly_seed = gtime())
-#define SK2_DLY_PICK() \
-    unsigned long long h_ = sk2_dly_seed ^ (0x9E3779B97F4A7C15ull * (unsigned long long)(blockIdx.x + 1)); \
-    h_ ^= h_ >> 30; h_ *= 0xBF58476D1CE4E5B9ull; h_ ^= h_ >> 27; h_ *= 0x94D049BB133111EBull; h_ ^= h_ >> 31; \
-    const int dly_w = (int)(h_ % (unsigned long long)NESC), dly_st = (int)((h_ >> 32) % (unsigned long long)(nst > 0 ? nst : 1));
-#else
 #define SK2_WAIT(bar, par) mbar_wait_sleep((bar), (par))
-#define SK2_DELAY_HOOK(st_) do { } while (0)
-#define SK2_DLY_SEED_DECL
-#define SK2_DLY_SEED_SET() ((void)0)
-#define SK2_DLY_PICK()
-#endif
-#ifndef SK2_NESC
-#define SK2_NESC 3
-#endif
-#ifndef SK2_DIAG
 #define SK2_DIAG 0
-#endif
 // ============================================================================ sk2 (m <= 32): swapped operands
 // A = x tile (16 tokens x 16 k; ldmatrix from the TMA-loaded, 128B-swizzled tile), B = weights (8 rows x 16 k),
 // decoded to registers from the 12-bit stream (BF16 hi + lo for the router).  Each CTA owns R rows over the whole
@@ -1106,14 +974,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
            const __nv_bfloat16* __restrict__ x, OutT* __restrict__ out,
            const int2* __restrict__ ptab, int pmax, uint32_t base4, int M, int N, int K, int dg,
            unsigned long long* __restrict__ dbg) {
-#if __CUDA_ARCH__ >= 900
   const int dgv = SK2_DIAG ? dg : 0;   // diagnostics (dg) compiled out of production builds
-  auto gtime = []() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; };
-  const unsigned other_cta = CL > 1 ? 1u : gridDim.x / 2;
-  const bool trace = (dgv & 32) && dbg != nullptr && (blockIdx.x == 0 || blockIdx.x == other_cta);
-  unsigned long long* tr = trace ? dbg + (blockIdx.x == 0 ? 0 : 4096) : nullptr;
-  const unsigned long long t_start = (dgv & 32) ? gtime() : 0ull;
-  if (trace && threadIdx.x == 0) tr[0] = t_start;
   constexpr int NW = NWR * WSK;
   constexpr int NC = NW * 32;
   constexpr int R = NWR * NT * 8;
@@ -1133,7 +994,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   unsigned char* gbase = smem_raw + (sbase - sraw);
   const uint32_t bars = sbase + NSTAGE * SST;
   const uint32_t full0 = bars, empty0 = bars + 8 * NSTAGE, pbar = bars + 16 * NSTAGE, cbar = pbar + 8, qbar = pbar + 16;
-  SK2_DLY_SEED_DECL
   // corrections, one copy per escape warp: [NESC][TOKS tokens][CP]; escape warps take turns on the stages
   constexpr int NESC = COMP ? (NSTAGE >= 4 ? 4 : NSTAGE) : 1;
   static_assert(NESC <= NSTAGE, "sk2: escape warps need NESC <= NSTAGE");
@@ -1166,7 +1026,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     // (CL > 1) a cluster-scope release issued AFTER a copy is in flight waits for it (~0.7 us): there every barrier
     // is initialized and fenced before the first copy.
     asm volatile("prefetch.tensormap [%0];" :: "l"(&xmap) : "memory");
-    SK2_DLY_SEED_SET();
     mbar_init(full0, 1);
     if constexpr (CL > 1) {
       mbar_init(empty0, NW + (COMP ? NESC : 0));
@@ -1209,7 +1068,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       for (int st = 1; st < nst; ++st) {
         const int slot = st % NSTAGE;
         if (st >= NSTAGE) SK2_WAIT(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);
-        if (trace) tr[16 + 3 * st] = gtime();
         const uint32_t s0 = sbase + slot * SST;
         mbar_expect_tx(full0 + 8 * slot, ((dgv & 4) ? 0 : XBYr) + WBY);
         bulk_g2s(s0 + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * slot);
@@ -1225,7 +1083,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     // escapes, read from the x tiles of the ring as each stage lands (the table is in k order); lane t owns token t,
     // so corr[t][row] accumulates with no atomics; each warp has its own copy
     const int ew = warp - (NW + 1);
-    SK2_DLY_PICK()
     if (COMP) {
       float* cr = corr + ew * CSZ;
       for (int i = lane; i < TOKS * CP; i += 32) cr[i] = 0.f;
@@ -1246,7 +1103,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
           while (pe <= cnt && (ptab_s[pe].x & 0xFFFF) < kend) ++pe;
           __syncwarp();
           if (lane == 0) mbar_arrive(empty0 + 8 * slot);
-          SK2_DELAY_HOOK(st);
           continue;
         }
         const unsigned char* xs = gbase + slot * SST;
@@ -1264,7 +1120,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
         }
         __syncwarp();
         if (lane == 0) mbar_arrive(empty0 + 8 * slot);
-        SK2_DELAY_HOOK(st);
       }
     }
     mbar_arrive(cbar);
@@ -1292,9 +1147,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   for (int st = 0; st < nst; ++st) {
     const int slot = st % NSTAGE;
     mbar_wait(full0 + 8 * slot, (st / NSTAGE) & 1);
-    if (trace && warp == 0 && lane == 0) tr[16 + 3 * st + 1] = gtime();
     const uint32_t s0 = sbase + slot * SST;
-    if (dgv & 2) { __syncwarp(); if (lane == 0) mbar_arrive(empty0 + 8 * slot); continue; }
 #pragma unroll
     for (int uu = 0; uu < UPW; ++uu) {
       const int ui = wk * UPW + uu;
@@ -1322,10 +1175,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       }
       uint32_t a[4][MT][4];
       if (dgv & 16) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-#pragma unroll
-          for (int mt = 0; mt < MT; ++mt) a[j][mt][0] = a[j][mt][1] = a[j][mt][2] = a[j][mt][3] = 0x3f803f80u;
       } else {
 #pragma unroll
         for (int j = 0; j < 4; ++j)
@@ -1349,17 +1198,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
         }
       }
       // 3) tensor-core work: independent accumulators per k-step
-      if (dgv & 8) {   // diagnostic: replace the tensor-core instructions by ALU work
-        const int nh = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-#pragma unroll
-          for (int nt = 0; nt < NT; ++nt) {
-            if (j < nh) mma_bf16(acc[j % NACC][0][nt], a[j][0][0], a[j][0][1], a[j][0][2], a[j][0][3], b[nt][2 * j], b[nt][2 * j + 1]);
-            else acc[j % NACC][0][nt][0] += __uint_as_float((b[nt][2 * j] ^ b[nt][2 * j + 1]) & a[j][0][0] & 0x007fffffu);
-          }
-        continue;
-      }
 #pragma unroll
       for (int j = 0; j < 4; ++j)
 #pragma unroll
@@ -1376,15 +1214,9 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * slot);
     }
-    if (trace && warp == 0 && lane == 0) tr[16 + 3 * st + 2] = gtime();
   }
-  if (trace && lane == 0) tr[1 + warp] = gtime();   // per consumer warp: main loop done
 
   // ---------------- epilogue: K-warps reduce through shared memory (the ring is free now)
-  if (dgv & 1) {
-    if (acc[0][0][0][0] == 1.2345e-30f) out[tid] = cvt_out<OutT>(acc[NACC - 1][0][0][1]);
-    return;
-  }
   if constexpr (COMP) mbar_wait(cbar, 0);   // the escape warp reads the ring's x tiles until it is done
   if (CL > 1 && crank > 0) {
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");   // rank 0's qbar is initialized
@@ -1421,11 +1253,9 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
         asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];"
                      :: "r"(a0 + 8 * RP * 4), "r"(__float_as_uint(v[2])), "r"(__float_as_uint(v[3])), "r"(qbar_r) : "memory");
       }
-    if (trace && tid == 0) tr[15] = gtime();
     return;
   }
   named_bar(1, NC);
-  if (trace && tid == 0) tr[9] = gtime();
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
@@ -1440,22 +1270,14 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
 #pragma unroll
         for (int c = 1; c < NACC; ++c) v[e] += acc[c][mt][nt][e];
       }
-      if (trace && mt == 0 && nt == 0) {
-        asm volatile("" :: "f"(v[0]), "f"(v[1]), "f"(v[2]), "f"(v[3]));
-        if (tid == 0) tr[12] = gtime();
-      }
       *reinterpret_cast<float2*>(r0) = make_float2(v[0], v[1]);
       *reinterpret_cast<float2*>(r0 + 8 * RP) = make_float2(v[2], v[3]);
     }
-  if (trace && tid == 0) tr[11] = gtime();
   named_bar(1, NC);
-  if (trace && tid == 0) tr[10] = gtime();
-  if (trace && tid == 0) tr[13] = gtime();
   if constexpr (CL > 1) {
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     mbar_wait_cluster(qbar, 0);
   }
-  if (trace && tid == 0) tr[14] = gtime();
   constexpr int R4 = R / 4;
   for (int idx = tid; idx < R4 * M; idx += NC) {
     const int tt = idx / R4, row = (idx - tt * R4) * 4;
@@ -1492,12 +1314,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       *reinterpret_cast<uint2*>(o) = pk;
     }
   }
-  if (trace && tid == 0) tr[15] = gtime();
-  if ((dgv & 32) && dbg != nullptr && tid == 0) {   // every CTA: SM id, start and end time
-    unsigned smid; asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-    dbg[8192 + 3 * cta] = smid; dbg[8192 + 3 * cta + 1] = t_start; dbg[8192 + 3 * cta + 2] = gtime();
-  }
-#endif
 }
 
 template <int MT, int TOKR, int NT, int NWR, int WSK, int UPW, int NSTAGE, bool COMP, bool HL, int NACC, int CL, typename OutT>
@@ -1612,16 +1428,10 @@ wide_kernel(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CU
 
   if (tid == 0) {
     for (int i = 0; i < STAGES; ++i) {
-#if __CUDA_ARCH__ >= 900
       mbar_init(full0 + 8 * i, 1);
-#else
-      mbar_init(full0 + 8 * i, 32);
-#endif
       mbar_init(empty0 + 8 * i, NWG);
     }
-#if __CUDA_ARCH__ >= 900
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-#endif
     if (splits > 1) asm volatile("prefetch.global.L2 [%0];" :: "l"(counters + zh * nrb + rb));
   }
 
@@ -1629,7 +1439,6 @@ wide_kernel(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CU
   auto issue = [&](int i) {
     const int slot = i % STAGES;
     const uint32_t st = sbase + slot * ST_BYTES;
-#if __CUDA_ARCH__ >= 900
     mbar_expect_tx(full0 + 8 * slot, ST_BYTES);
     tma_load_2d_el(st, &mapB, full0 + 8 * slot, (u0 + i) * 64, t0z);
     if constexpr (HLW) {   // router: BF16 hi and lo tiles [64 rows x 64 k] by TMA (128B swizzle) from [hi | lo]
@@ -1638,36 +1447,14 @@ wide_kernel(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CU
     } else {
       bulk_g2s(st + B_BYTES, wsrc + (size_t)i * A_BYTES, A_BYTES, full0 + 8 * slot);
     }
-#else
-    for (int idx = lane; idx < TOK * 8; idx += 32) {
-      const int t = idx >> 3, c = idx & 7;
-      const uint32_t dst = st + t * 128 + ((c ^ (t & 7)) << 4);
-      const __nv_bfloat16* src = x + (size_t)(t0z + (t < Mz ? t : 0)) * K + (u0 + i) * 64 + c * 8;
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(t < Mz ? 16 : 0) : "memory");
-    }
-    const char* wa = reinterpret_cast<const char*>(wsrc) + (size_t)i * A_BYTES;
-    for (int off = lane * 16; off < A_BYTES; off += 512)
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(st + B_BYTES + off), "l"(wa + off) : "memory");
-    asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" :: "r"(full0 + 8 * slot) : "memory");
-#endif
   };
-#if __CUDA_ARCH__ >= 900
   const bool producer = tid == 0;
-#else
-  const bool producer = warp == 0;
-#endif
-#if __CUDA_ARCH__ >= 900
   if (producer) {   // thread 0: barriers are initialized (program order) -> issue before the CTA barrier
     asm volatile("prefetch.tensormap [%0];" :: "l"(&mapB) : "memory");
     if constexpr (HLW) asm volatile("prefetch.tensormap [%0];" :: "l"(&mapA) : "memory");
     for (int i = 0; i < STAGES && i < nst; ++i) issue(i);
   }
   __syncthreads();
-#else
-  __syncthreads();
-  if (producer)
-    for (int i = 0; i < STAGES && i < nst; ++i) issue(i);
-#endif
   // escape table + the x values it needs -> shared memory (used after the main loop)
   {
     const int2* tab = ptab + (size_t)cta * pmax;
@@ -1692,7 +1479,6 @@ wide_kernel(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CU
     const uint32_t st = sbase + slot * ST_BYTES;
     const uint32_t wa = st + B_BYTES + warp * WB + lane * 16;
     if constexpr (HLW) {
-#if __CUDA_ARCH__ >= 900
       // router: SS-wgmma on the TMA'd hi and lo tiles (no register-sourced operands: the wgmma pipeline stays full)
 #pragma unroll
       for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
@@ -1706,37 +1492,6 @@ wide_kernel(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CU
       wg_wait<1>();
 #pragma unroll
       for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
-#else
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {   // h = 0: hi tile, 1: lo tile (same B) -> FP32 sum of both
-          uint32_t* af = afrag[h];
-          asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(af[0]), "=r"(af[1]), "=r"(af[2]), "=r"(af[3])
-                       : "r"(wa + h * 2048 + j * 512));
-#if __CUDA_ARCH__ >= 900
-#pragma unroll
-          for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
-          wg_fence();
-          wgmma_bn<TOK>(acc, af[0], af[1], af[2], af[3], make_desc_sw128(st + j * 32));
-          wg_commit();
-          wg_wait<1>();
-#pragma unroll
-          for (int q = 0; q < 4; ++q) asm volatile("" : "+r"(afrag[0][q]), "+r"(afrag[1][q]) :: "memory");
-#else
-          const unsigned char* tile = gbase + slot * ST_BYTES;
-#pragma unroll
-          for (int jj = 0; jj < TOK / 8; ++jj) {
-            const int tok = jj * 8 + g;
-            const unsigned char* row = tile + tok * 128;
-            const uint32_t b0 = *reinterpret_cast<const uint32_t*>(row + (((2 * j) ^ (tok & 7)) << 4) + 4 * t4);
-            const uint32_t b1 = *reinterpret_cast<const uint32_t*>(row + (((2 * j + 1) ^ (tok & 7)) << 4) + 4 * t4);
-            mma_bf16(acc + 4 * jj, af[0], af[1], af[2], af[3], b0, b1);
-          }
-#endif
-        }
-      }
-#endif
     } else {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -1746,7 +1501,6 @@ wide_kernel(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CU
       asm volatile("ld.shared.u32 %0, [%1];" : "=r"(cw) : "r"(wa + 1024 + 4 * j));
       uint32_t* af = afrag[j & 1];
       decode8(lw0, lw1, cw, base4, af);
-#if __CUDA_ARCH__ >= 900
 #pragma unroll
       for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
       wg_fence();
@@ -1755,20 +1509,8 @@ wide_kernel(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CU
       wg_wait<1>();
 #pragma unroll
       for (int q = 0; q < 4; ++q) asm volatile("" : "+r"(afrag[0][q]), "+r"(afrag[1][q]) :: "memory");
-#else
-      const unsigned char* tile = gbase + slot * ST_BYTES;
-#pragma unroll
-      for (int jj = 0; jj < TOK / 8; ++jj) {
-        const int tok = jj * 8 + g;
-        const unsigned char* row = tile + tok * 128;
-        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(row + (((2 * j) ^ (tok & 7)) << 4) + 4 * t4);
-        const uint32_t b1 = *reinterpret_cast<const uint32_t*>(row + (((2 * j + 1) ^ (tok & 7)) << 4) + 4 * t4);
-        mma_bf16(acc + 4 * jj, af[0], af[1], af[2], af[3], b0, b1);
-      }
-#endif
     }
     }  // !HLW
-#if __CUDA_ARCH__ >= 900
     // stage i-1's wgmmas are complete (one group in flight) -> its slot can be refilled
     if (i > 0) {
       if ((tid & 127) == 0) mbar_arrive(empty0 + 8 * ((i - 1) % STAGES));
@@ -1777,16 +1519,10 @@ wide_kernel(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CU
         issue(i - 1 + STAGES);
       }
     }
-#else
-    named_bar(1, NT);   // check path: every warp is done with this slot -> refill it
-    if (producer && i + STAGES < nst) issue(i + STAGES);
-#endif
   }
-#if __CUDA_ARCH__ >= 900
   wg_wait<0>();
 #pragma unroll
   for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
-#endif
 
   // ---------------- exact corrections for escapes (table + x values staged at kernel start)
   named_bar(1, NT);
@@ -2050,24 +1786,12 @@ GEMM_CONFIGS = {  # (layer, bn) -> (nwg, splits, stages); grid = (N / (64 nwg), 
 }
 
 
-DIAG_LAYERS = ()
 GEMM_DIAG = False   # diagnostic: also time gemm90 variants (TMA-2D A vs contiguous pre-swizzled A) on m 65..256
 
 
-def swizzle_tiles(w, bm):
-    """W [N, K] -> [N/bm][K/64][bm rows x 128 B] with the 128B swizzle (16-byte chunk c of row r at c ^ (r % 8))."""
-    n, k = w.shape
-    t = w.view(n // bm, bm, k // 64, 8, 8).permute(0, 2, 1, 3, 4)  # [rb, kb, r, c, 8]
-    r = torch.arange(bm, device=w.device).view(bm, 1)
-    p = torch.arange(8, device=w.device).view(1, 8)
-    src_c = (p ^ (r % 8)).view(1, 1, bm, 8, 1).expand(t.shape[0], t.shape[1], bm, 8, 8)
-    return torch.gather(t, 3, src_c).contiguous()
 
 
 def _gemm_src(sm90):
-    if not sm90:
-        return ('void gemm90(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, '
-                'int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) { TORCH_CHECK(false, "gemm90 needs sm_90"); }')
     lines = []
     for (layer, bn), (nwg, splits, stages) in sorted(GEMM_CONFIGS.items()):
         f32 = layer == "router"
@@ -2090,7 +1814,6 @@ template <int BN, int NWG, int NSTAGE, int CL>
 __global__ void __launch_bounds__(NWG * 128 + 32, 1)
 gq_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUtensorMap mapX,
           __nv_bfloat16* __restrict__ out, int M, int N, int K) {
-#if __CUDA_ARCH__ >= 900
   constexpr int BM = NWG * 64;
   constexpr int A_BYTES = BM * 128;
   constexpr int B_BYTES = BN * 128;
@@ -2236,50 +1959,6 @@ gq_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUte
     }
     return;
   }
-  if (CL > 1 && crank > 0) {
-    // stage the accumulators in this CTA's (now idle) ring, then one bulk shared::cluster copy into rank 0's buffer
-    float* mine = reinterpret_cast<float*>(gbase);   // [NWG][NACC][128]
-    if constexpr (NWG > 1) named_bar(1, NWG * 128);   // every warpgroup is done reading the ring
-#pragma unroll
-    for (int q = 0; q < NACC; ++q) mine[(wg * NACC + q) * 128 + t] = acc[q];
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    named_bar(1, NWG * 128);
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");   // rank 0's qbar is initialized
-    if (tid == 0) {
-      const uint32_t peer_l = (uint32_t)__cvta_generic_to_shared(peer + (crank - 1) * NWG * NACC * 128);
-      uint32_t peer_r, qbar_r;
-      asm volatile("mapa.shared::cluster.u32 %0, %1, 0;" : "=r"(peer_r) : "r"(peer_l));
-      asm volatile("mapa.shared::cluster.u32 %0, %1, 0;" : "=r"(qbar_r) : "r"(qbar));
-      asm volatile("cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                   :: "r"(peer_r), "r"((uint32_t)__cvta_generic_to_shared(mine)), "r"(NWG * NACC * 128 * 4), "r"(qbar_r)
-                   : "memory");
-      asm volatile("cp.async.bulk.commit_group;\n\tcp.async.bulk.wait_group.read 0;" ::: "memory");
-    }
-    return;
-  }
-  if constexpr (CL > 1) {
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    mbar_wait_cluster(qbar, 0);
-#pragma unroll
-    for (int r = 0; r < CL - 1; ++r)
-#pragma unroll
-      for (int q = 0; q < NACC; ++q) acc[q] += peer[((r * NWG + wg) * NACC + q) * 128 + t];
-  }
-  const int g = lane >> 2, t4 = lane & 3;
-  const int row_w = rb * BM + wg * 64 + (warp & 3) * 16;
-#pragma unroll
-  for (int j = 0; j < BN / 8; ++j) {
-    const int t0 = 8 * j + 2 * t4;
-    if (t0 < M) {
-      out[(size_t)t0 * N + row_w + g] = __float2bfloat16_rn(acc[4 * j]);
-      out[(size_t)t0 * N + row_w + g + 8] = __float2bfloat16_rn(acc[4 * j + 2]);
-    }
-    if (t0 + 1 < M) {
-      out[(size_t)(t0 + 1) * N + row_w + g] = __float2bfloat16_rn(acc[4 * j + 1]);
-      out[(size_t)(t0 + 1) * N + row_w + g + 8] = __float2bfloat16_rn(acc[4 * j + 3]);
-    }
-  }
-#endif
 }
 
 template <int BN, int NWG, int NSTAGE, int CL>
@@ -2312,8 +1991,6 @@ static void launch_gq(const at::Tensor& W, const at::Tensor& x, at::Tensor& out,
     lc.numAttrs = 1;
     C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kern, mW, mX, op, M, N, K));
   } else {
-    kern<<<N / BM, NWG * 128 + 32, smem, at::cuda::getCurrentCUDAStream()>>>(mW, mX, op, M, N, K);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
 
@@ -2341,7 +2018,6 @@ template <int BN, int NWG, int NSTAGE, int CL>
 __global__ void __launch_bounds__(NWG * 128 + 32, 1)
 gqx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUtensorMap mapX,
            __nv_bfloat16* __restrict__ out, int M, int N, int K) {
-#if __CUDA_ARCH__ >= 900
   constexpr int BM = NWG * 64;
   constexpr int A_BYTES = BM * 128;
   constexpr int B_BYTES = BN * 128;
@@ -2430,7 +2106,6 @@ gqx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
   for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
 
   const int g = lane >> 2, t4 = lane & 3;
-  const int row0 = rb * BM + wg * 64 + (warp & 3) * 16 + g;
   if constexpr (CL > 1) {
     // 1) fragments out right away (own area: no need to wait for the other ranks' main loops), 2) one cluster
     // barrier, 3) the owner of each token block sums the other ranks' copies over DSMEM, stages BF16 [token][64 rows]
@@ -2485,20 +2160,7 @@ gqx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
     // nobody leaves while another rank may still read its fragments
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
   } else {
-#pragma unroll
-    for (int j = 0; j < BN / 8; ++j) {
-      const int t0 = 8 * j + 2 * t4;
-      if (t0 < M) {
-        out[(size_t)t0 * N + row0] = __float2bfloat16_rn(acc[4 * j]);
-        out[(size_t)t0 * N + row0 + 8] = __float2bfloat16_rn(acc[4 * j + 2]);
-      }
-      if (t0 + 1 < M) {
-        out[(size_t)(t0 + 1) * N + row0] = __float2bfloat16_rn(acc[4 * j + 1]);
-        out[(size_t)(t0 + 1) * N + row0 + 8] = __float2bfloat16_rn(acc[4 * j + 3]);
-      }
-    }
   }
-#endif
 }
 
 template <int BN, int NWG, int NSTAGE, int CL>
@@ -2546,9 +2208,6 @@ TORCHT_LAYERS = ("unpooler", "o")   # layers that also get a K-major BF16 copy f
 
 
 def _gqx_src(sm90):
-    if not sm90:
-        return ('void gqx(at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, '
-                'int64_t) { TORCH_CHECK(false, "gqx needs sm_90"); }')
     lines = []
     for (layer, bn), (nwg, cl, ns) in sorted(GQX_CONFIGS.items()):
         lines.append(f"if (bn == {bn} && nwg == {nwg} && cl == {cl} && nstage == {ns}) "
@@ -2843,9 +2502,6 @@ void rgemv(at::Tensor W, at::Tensor x, at::Tensor out, int64_t M) {
 
 
 def _gq_src(sm90):
-    if not sm90:
-        return ('void gq(at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, '
-                'int64_t) { TORCH_CHECK(false, "gq needs sm_90"); }')
     lines = []
     for (layer, bn), (nwg, cl, ns) in sorted(GQ_CONFIGS.items()):
         lines.append(f"if (bn == {bn} && nwg == {nwg} && cl == {cl} && nstage == {ns}) "
@@ -2879,8 +2535,6 @@ def _wide_src(sm90):
     lines = []
     for (layer, tok, nz), (nwg, splits, stages) in sorted(WIDE_CONFIGS.items()):
         hl = layer == "router"
-        if not sm90:
-            stages = min(stages, 3 if not hl else 2)  # sm_80 check path: 163 KB of shared memory
         ot = "float" if hl else "__nv_bfloat16"
         lines.append(f"if (nwg == {nwg} && tok == {tok} && hl == {int(hl)}) "
                      f"{{ launch_wide<{nwg}, {tok}, {stages}, {str(hl).lower()}, {ot}>(Wst, x, out, ws, counters, ptab, pmax, base4, "
@@ -2922,7 +2576,6 @@ __device__ __forceinline__ void rk_wgmma(float d[4][8], uint64_t da, uint64_t db
 
 __global__ void __launch_bounds__(192, 1) rk_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUtensorMap mapX,
                                                      float* __restrict__ out, int M, int S, int ntt, int* __restrict__ zcnt) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   constexpr int BM = 64, BN = 64, NJ = 4, QS = RK_QS;
   constexpr int W_BYTES = 2 * BM * 128, ST = W_BYTES + BN * 128;
   extern __shared__ __align__(1024) unsigned char rk_smem[];
@@ -3031,7 +2684,6 @@ __global__ void __launch_bounds__(192, 1) rk_kernel(const __grid_constant__ CUte
                    :: "l"(out + (size_t)c * 256 + rt * BM + qd * 4), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w) : "memory");
     }
   }
-#endif
 }
 static PFN_cuTensorMapEncodeTiled_v12000 rk_encode() {
   static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
@@ -3074,12 +2726,10 @@ void rk(at::Tensor Wc, at::Tensor x, at::Tensor out, int64_t S, at::Tensor zc) {
 def _rk_src(sm90):
     if sm90:
         return RK_SRC
-    return 'void rk(at::Tensor, at::Tensor, at::Tensor, int64_t, at::Tensor) { TORCH_CHECK(false, "rk needs sm_90"); }'
 
 
 # ---------------------------------------------------------------------------
 # Extension build: everything above is assembled into one CUDA translation
-# unit here. On non-sm_90 the sm_90-only routes compile to TORCH_CHECK stubs.
 # ---------------------------------------------------------------------------
 def _get_ext():
     """Compile everything as one CUDA translation unit with load_inline.
@@ -3214,8 +2864,6 @@ def _build_cutlass():
     global _cut_ext, _cut_err
     try:
         major, minor = torch.cuda.get_device_capability()
-        if major < 9:
-            raise RuntimeError("needs sm_90")
         spec = importlib.util.find_spec("flashinfer")
         if spec is None or not spec.submodule_search_locations:
             raise RuntimeError("flashinfer (CUTLASS headers) not installed")
@@ -3402,6 +3050,8 @@ SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC, CL
     ('router', 'router', 256, 8, 1, 1, 8, 1, 4, 3),
     ('slice8_r192', 'unpooler', UNPOOLER_SLICE_ROWS, 8, 1, 1, 8, 2, 2, 1),
     ('unpooler32_r144', 'unpooler', 8192, 64, 4, 2, 2, 2, 1, 1),
+    # okc_tune (14173ac4) retimed winners, Oct 25 12:30 (search-harness ratios vs production in brackets); pair.py both
+    # orders: pooler16 -0.43, unpooler16 -0.60, o16 -0.15, qkv8 -0.12, qkv16 -0.08 us (pooler32 r160 / o32 r88: no gain)
     ('pooler16t_r192', 'pooler', 4096, 32, 2, 2, 2, 4, 1, 1),      # tokr16 [0.973 vs 1.0]
     ('unpooler16t_r72', 'unpooler', 8192, 32, 2, 2, 2, 2, 1, 1),   # tokr16 [0.961 vs 0.969]
     ('qkv8t_r144', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),         # tokr8 [0.969 vs 0.979]
@@ -3465,9 +3115,6 @@ def _sk2_geom(cfg, tokr):
 
 
 def _sk2_src(sm90):
-    if not sm90:
-        return ('void sk2(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, '
-                'int64_t, int64_t, int64_t, at::Tensor) { TORCH_CHECK(false, "sk2 needs sm_90"); }')
     lines = []
     for ci, cfg in enumerate(SK2_CONFIGS):
         name, layer, n_rows, R, NT, NWR, WSK, UPW, NACC, CL = cfg
@@ -3526,6 +3173,7 @@ def sk2_compress(w):
 
 
 CG_CONFIGS = {"qkv_gate": (2, 256), "o": (2, 64), "unpooler": (2, 128), "pooler": (2, 512)}   # layer -> (rows per CTA, threads); m = 1
+# (v137: pooler m=1 cgemv 2x512 measured -0.34 us vs sk2; 2x256 ties sk2, 4/8 rows or 1 row lose)
 
 
 def cg_compress(w, rows_per_cta):
@@ -3641,8 +3289,6 @@ def sk2_table(comp, n_cfg, R):
 
 def sk2_prepare(weights, state):
     state["sk2"] = {}
-    if not (USE_SK2 and state["sm90"]):
-        return
     dev = weights["o"].device
     shared = {}
     for ci, cfg in enumerate(SK2_CONFIGS):
@@ -3745,8 +3391,6 @@ def prepare(weights):
     for (lname, tok, nz), (nwg, splits, stages) in WIDE_CONFIGS.items():
         gemm_floats = max(gemm_floats, nz * (WEIGHT_ROWS[lname] // (64 * nwg)) * splits * (nwg * 64) * tok)
     state["mid_ws_shared"] = torch.empty(gemm_floats, dtype=torch.float32, device=dev)
-    if GEMM_DIAG:
-        state["ws_shared_diag"] = torch.empty(4 * 1024 * 1024, dtype=torch.float32, device=dev)
     for name, w in weights.items():
         if name == "router":
             hi = w.to(torch.bfloat16)
@@ -3766,8 +3410,6 @@ def prepare(weights):
             t = src.view(nrg_r, u_all, 4, 2, 32, 8).permute(0, 1, 3, 2, 4, 5).contiguous()   # [rg, u, hl, 4, 32, 8]
             nwg_r = WIDE_CONFIGS[("router", 128, 1)][0]
             t = t.view(nrg_r // (4 * nwg_r), 4 * nwg_r, u_all, 2 * 4 * 32 * 8).permute(0, 2, 1, 3).contiguous()
-            if not sm90_:   # sm_90 runs the router's wide path on router_cat (TMA tiles); the fragment stream is sm_80's
-                state["streams"][("router", 0, 4 * nwg_r, 1, 4, w.shape[0])] = t
             del t
             for (lname, tok, nz), (nwg, splits, stages) in WIDE_CONFIGS.items():
                 if lname == "router":
@@ -3819,13 +3461,6 @@ def prepare(weights):
     state["nsm"] = torch.cuda.get_device_properties(dev).multi_processor_count   # rk: one resident CTA per SM
     state["old_paths"] = old_paths
     sk2_prepare(weights, state)
-    if GEMM_DIAG and state["sm90"]:
-        state["wtile"], state["diag_cnt"] = {}, {}
-        for layer in DIAG_LAYERS:
-            state["wtile"][layer] = swizzle_tiles(state["raw"][layer], 128)
-            for a_s in (0, 1):
-                for sp_ in sorted({GEMM_CONFIGS[(layer, 128)][1], GEMM_CONFIGS[(layer, 256)][1], 1}):
-                    state["diag_cnt"][(layer, a_s, sp_)] = torch.zeros(WEIGHT_ROWS[layer] // 16, dtype=torch.int32, device=dev)
     if cut_thread is not None:
         cut_thread.join(timeout=CUTLASS_BUILD_TIMEOUT)   # ~70-80 s on an H200 pod; never let it threaten prepare's limit
         if cut_thread.is_alive():
@@ -3858,10 +3493,6 @@ ROUTE_ROUTER = [(32, "skinny"), (256, "wide")]
 def _route(layer, m, sm90):
     for mmax, r in (ROUTE_ROUTER if layer == "router" else ROUTE_BF16):
         if m <= mmax:
-            if r == "gemm" and not sm90:
-                return "torch"
-            if r == "wide" and not (sm90 or WIDE_SM80_TEST):
-                return "torch"
             return r
     return "torch"
 
@@ -4180,13 +3811,6 @@ def kernel_fn(data, state):
     layer, m, n, k = cfg["layer"], cfg["m"], cfg["n"], cfg["k"]
     choice = state.get("choice", {}).get((layer, m)) or _nearby_choice(layer, m, state) or _static_choice(layer, m, state)
     out = _run(choice, x, layer, m, n, k, state)
-    if GEMM_DIAG:
-        _diag(x, layer, m, n, k, state, choice)
     return out
 
 
-def _diag(x, layer, m, n, k, state, choice):
-    """Extra kernels for the judge's per-kernel profile (outputs discarded)."""
-    if choice[0] == "skinny" and m == 1 and layer in ("o", "unpooler") and state["comp"][layer]:
-        for dg in (1, 2, 3):   # same kernel without epilogue / x loads / compute
-            _run_skinny(x, layer, m, n, k, state, choice[1], choice[2], dg)
