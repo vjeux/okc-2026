@@ -17,3 +17,21 @@ Each file is native CUDA, compiled with `torch.utils.cpp_extension.load_inline`.
 ## License
 
 Apache 2.0 — see `LICENSE`.
+
+## Attention regression tests
+
+Install PyTorch and pytest, then run `python -m pytest -q tests/test_attention_decode.py`.
+CPU tests exercise the PyTorch fallback against an independent, per-query reference
+and an analytic uniform-attention case. Native tests require an sm_90a GPU and a
+CUDA toolkit; they are skipped on other hardware. They cover page-end appends,
+scattered pages, causal window edges, new-cache writes, empty trailing splits,
+and repeated launches through default, plain split and cooperative plans.
+A separate CUDA test checks the actual BF16 rounding helper at rounding ties.
+
+The native numerical checks allow FP8 query error: output relative L2 is bounded
+by `clamp(2.5 * fp8_query_error + 0.015, 0.03, 0.15)`, with a per-row guard;
+new cache entries allow relative L2 of 0.08. These tests do not require bitwise
+agreement with the FP32 reference or establish a performance improvement.
+CPU results alone do not validate CUDA compilation, synchronization, CUDA graph
+replay, or native accuracy. Cluster/flat plans and full benchmark shapes still
+need GPU validation beyond this small regression suite.

@@ -278,10 +278,9 @@ __device__ __forceinline__ uint32_t pack_h2(float lo, float hi) {
 __device__ __forceinline__ uint32_t ex2h2(float lo, float hi) {
   return pack_h2(ex2(lo), ex2(hi));
 }
-// conformance sensitivity probe only : round the attention output, which SGLang keeps in
-// BF16 before rmsnorm * gate, to e4m3 -- the precision check must reject that build
-__device__ __forceinline__ float pr8(float x) {
-  return x;
+// Preserve BF16 activation boundaries while keeping the surrounding arithmetic in FP32.
+__device__ __forceinline__ float round_bf16(float x) {
+  return __bfloat162float(__float2bfloat16_rn(x));
 }
 __device__ __forceinline__ uint8_t to_e4m3(float x) {
   return (uint8_t)__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
@@ -745,7 +744,7 @@ __device__ __forceinline__ void cluster_finish(const Params& p, SM& S, const int
       const float lsum = act ? RL[rl] : 0.f;
       const float inv = lsum > 0.f ? __fdividef(vscale, lsum) : 0.f;
       const float4 a = act ? *reinterpret_cast<const float4*>(&RB[e * 4]) : make_float4(0.f, 0.f, 0.f, 0.f);
-      float y[4] = {pr8(a.x * inv), pr8(a.y * inv), pr8(a.z * inv), pr8(a.w * inv)};
+      float y[4] = {round_bf16(a.x * inv), round_bf16(a.y * inv), round_bf16(a.z * inv), round_bf16(a.w * inv)};
       float ss = y[0] * y[0] + y[1] * y[1] + y[2] * y[2] + y[3] * y[3];
       ss += __shfl_xor_sync(0xffffffffu, ss, 1);
       ss += __shfl_xor_sync(0xffffffffu, ss, 2);
@@ -900,8 +899,8 @@ __device__ __forceinline__ void fin_nc1(const Params& p, const int b, const int 
         if (part == 0) p.ws_l[(bp * L + j) * 16 + hh] = 0.f;
       }
       const float inv = lc[u] > 0.f ? __fdividef(vscale, lc[u]) : 0.f;
-      float y[8] = {pr8(xa[u].x * inv), pr8(xa[u].y * inv), pr8(xa[u].z * inv), pr8(xa[u].w * inv),
-                    pr8(xb[u].x * inv), pr8(xb[u].y * inv), pr8(xb[u].z * inv), pr8(xb[u].w * inv)};
+      float y[8] = {round_bf16(xa[u].x * inv), round_bf16(xa[u].y * inv), round_bf16(xa[u].z * inv), round_bf16(xa[u].w * inv),
+                    round_bf16(xb[u].x * inv), round_bf16(xb[u].y * inv), round_bf16(xb[u].z * inv), round_bf16(xb[u].w * inv)};
       float ss = 0.f;
 #pragma unroll
       for (int e = 0; e < 8; ++e) ss += y[e] * y[e];
@@ -1397,6 +1396,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
           x[2 * e + 1] = a0 * sn + a1 * c;
         }
       }
+      for (int e = 0; e < 16; ++e) x[e] = round_bf16(x[e]);
       const int hk4 = hh >> 3, gg4 = hh & 7;
       const int r4 = j * 8 + gg4, kb = q4 * 16;
       *reinterpret_cast<uint4*>(S.q8s + hk4 * 4096 + r4 * 64 + (((kb >> 4) ^ ((r4 >> 1) & 3)) << 4)) =
@@ -1434,6 +1434,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         x[2 * e + 1] = a0 * sn + a1 * c;
       }
     }
+    for (int e = 0; e < 8; ++e) x[e] = round_bf16(x[e]);
     // f16 query pre-scaled to log2 units, staged in the (still free) last pipeline stage
     uint4 qw;
     uint32_t* qwp = reinterpret_cast<uint32_t*>(&qw);
@@ -1443,7 +1444,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     const int hk = hh >> 3, gg = hh & 7;
     if constexpr (QDIR) {
       // straight to the e4m3 A tile of the SS QK^T wgmma (64-byte rows, 16-byte chunks swizzled by
-      // (row >> 1) & 3), one fp32 -> e4m3 rounding, no f16 staging / re-read (scout's census: ~90 instr / warp)
+      // (row >> 1) & 3), BF16-rounded query -> e4m3, no f16 staging / re-read
       const int r = j * 8 + gg, kb = partL * 8;
       *reinterpret_cast<uint2*>(S.q8s + hk * 4096 + r * 64 + (((kb >> 4) ^ ((r >> 1) & 3)) << 4) + (kb & 15)) =
           make_uint2(e4m3x4f(x[0], x[1], x[2], x[3]), e4m3x4f(x[4], x[5], x[6], x[7]));
@@ -1504,8 +1505,8 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         uint32_t w0 = 0, w1 = 0;
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
-          w0 |= (uint32_t)to_e4m3(x[e] * sc) << (8 * e);
-          w1 |= (uint32_t)to_e4m3(x[4 + e] * sc) << (8 * e);
+          w0 |= (uint32_t)to_e4m3(round_bf16(round_bf16(x[e]) * sc)) << (8 * e);
+          w1 |= (uint32_t)to_e4m3(round_bf16(round_bf16(x[4 + e]) * sc)) << (8 * e);
         }
         uint8_t* dst = (kind == 0 ? S.kn : S.vn) + jj * ROWB + hh * 64 + partL * 8;
         *reinterpret_cast<uint2*>(dst) = make_uint2(w0, w1);
@@ -2297,7 +2298,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       const float inv = lsum > 0.f ? __fdividef(vscale, lsum) : 0.f;
       float ss = 0.f;
 #pragma unroll
-      for (int e = 0; e < 8; ++e) { y[e] = pr8(y[e] * inv); ss += y[e] * y[e]; }
+      for (int e = 0; e < 8; ++e) { y[e] = round_bf16(y[e] * inv); ss += y[e] * y[e]; }
       ss += __shfl_xor_sync(0xffffffffu, ss, 1);
       ss += __shfl_xor_sync(0xffffffffu, ss, 2);
       ss += __shfl_xor_sync(0xffffffffu, ss, 4);
@@ -2343,7 +2344,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       const float inv = lsum > 0.f ? __fdividef(vscale, lsum) : 0.f;
       float ss = 0.f;
 #pragma unroll
-      for (int e = 0; e < 8; ++e) { y[e] = pr8(y[e] * inv); ss += y[e] * y[e]; }
+      for (int e = 0; e < 8; ++e) { y[e] = round_bf16(y[e] * inv); ss += y[e] * y[e]; }
       ss = oct_sum(ss);
       const float rn = rsqrtf(ss * (1.f / 64.f) + 1e-5f);
       const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&graw);
@@ -2436,7 +2437,7 @@ __device__ __forceinline__ void flat_finalize(const Params& p, const int* sense_
     const float inv = lsum > 0.f ? __fdividef(vscale, lsum) : 0.f;
     float ss = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) { y[e] = pr8(y[e] * inv); ss += y[e] * y[e]; }
+    for (int e = 0; e < 8; ++e) { y[e] = round_bf16(y[e] * inv); ss += y[e] * y[e]; }
     ss += __shfl_xor_sync(0xffffffffu, ss, 1);
     ss += __shfl_xor_sync(0xffffffffu, ss, 2);
     ss += __shfl_xor_sync(0xffffffffu, ss, 4);
